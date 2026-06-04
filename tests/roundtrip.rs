@@ -94,6 +94,56 @@ fn sevenzip_roundtrip_preserves_files() {
 }
 
 #[test]
+fn encrypted_zip_roundtrip_preserves_files() {
+    roundtrip(Backend::Zip); // PASS is non-empty -> AES-256 zip
+}
+
+#[test]
+fn plain_zip_roundtrip_preserves_files() {
+    if !available(Backend::Zip) {
+        return;
+    }
+    let ws = workspace();
+    let src = ws.path().join("notes_and_photos");
+    fs::create_dir_all(&src).unwrap();
+    sample_tree(&src);
+    let original = snapshot(&src);
+
+    let out = backend::suggested_output(&src, Backend::Zip);
+    backend::encrypt(Backend::Zip, &src, &out, "").unwrap(); // empty -> plain zip
+    assert!(out.exists());
+    assert!(
+        !backend::is_encrypted(&out).unwrap(),
+        "plain zip is not encrypted"
+    );
+
+    let dest = ws.path().join("restored");
+    backend::decrypt(&out, &dest, "").unwrap();
+    assert_eq!(original, snapshot(&dest.join("notes_and_photos")));
+}
+
+#[test]
+fn zip_rejects_wrong_password() {
+    let backend = Backend::Zip;
+    if !available(backend) {
+        return;
+    }
+    let ws = workspace();
+    let src = ws.path().join("stuff");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), b"data\n").unwrap();
+    let out = backend::suggested_output(&src, backend);
+    backend::encrypt(backend, &src, &out, PASS).unwrap();
+
+    let dest = ws.path().join("out");
+    let err = backend::decrypt(&out, &dest, "the wrong password").unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("wrong password"),
+        "expected a wrong-password error, got: {err}"
+    );
+}
+
+#[test]
 fn age_single_file_roundtrip() {
     let backend = Backend::Age;
     if !available(backend) {
@@ -262,6 +312,10 @@ fn backend_for_reads_extension() {
         backend::backend_for(&PathBuf::from("x.AGE")).unwrap(),
         Backend::Age
     );
+    assert_eq!(
+        backend::backend_for(&PathBuf::from("x.zip")).unwrap(),
+        Backend::Zip
+    );
     assert!(backend::backend_for(&PathBuf::from("x.txt")).is_err());
 }
 
@@ -271,6 +325,8 @@ fn suggested_output_appends_extension() {
     assert_eq!(p, PathBuf::from("/home/u/Photos.age"));
     let p = backend::suggested_output(Path::new("/home/u/Photos"), Backend::SevenZip);
     assert_eq!(p, PathBuf::from("/home/u/Photos.7z"));
+    let p = backend::suggested_output(Path::new("/home/u/Photos"), Backend::Zip);
+    assert_eq!(p, PathBuf::from("/home/u/Photos.zip"));
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {

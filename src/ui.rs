@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, BorderType, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, Field, Flow, Step};
+use crate::backend::Backend;
 use crate::browser::Row;
 
 const ACCENT: Color = Color::Cyan;
@@ -31,6 +32,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     match app.step {
         Step::Welcome => welcome(frame, body, app),
         Step::ChooseBackend => choose_backend(frame, body, app),
+        Step::ZipProtect => zip_protect(frame, body, app),
         Step::Browse => browse(frame, body, app),
         Step::Passphrase => passphrase(frame, body, app),
         Step::Review => review(frame, body, app),
@@ -59,7 +61,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let hint = match app.step {
         Step::Welcome => "↑↓ choose · Enter select · q quit",
         Step::ChooseBackend => "↑↓ choose · Enter select · Esc back",
-        Step::Browse => "↑↓ move · Enter open/choose · ← up a level · Esc back",
+        Step::ZipProtect => "↑↓ choose · Enter select · Esc back",
+        Step::Browse => "type to filter · paste a path · ↑↓ move · Enter open · ← up · Esc back",
         Step::Passphrase => match app.flow {
             Flow::Encrypt => "type password · Tab switch field · Enter continue · Esc back",
             Flow::Decrypt => "type password · Enter continue · Esc back",
@@ -99,10 +102,11 @@ fn welcome(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn choose_backend(frame: &mut Frame, area: Rect, app: &App) {
-    let options = ["Secure (age)", "Portable (7z)"];
+    let options = ["Secure (age)", "Portable (7z)", "Compatible (zip)"];
     let taglines = [
         "Strongest protection. Opens with zipline on any Linux machine.",
         "Opens in 7-Zip / Keka on Windows and macOS, without zipline.",
+        "Opens on any computer by double-clicking. Optional AES-256 password.",
     ];
     let mut lines = vec![
         Line::from(""),
@@ -144,6 +148,59 @@ fn choose_backend(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+fn zip_protect(frame: &mut Frame, area: Rect, app: &App) {
+    let options = [
+        "Protect with a password (AES-256)",
+        "No password — anyone can open it",
+    ];
+    let notes = [
+        "Scrambles the contents. Opens in 7-Zip / WinZip / Keka with the password.",
+        "Just a plain zip. Convenient to share, but not protected.",
+    ];
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Lock this zip with a password?",
+            Style::new().fg(Color::Gray),
+        )),
+        Line::from(""),
+    ];
+    for (i, (opt, note)) in options.iter().zip(notes).enumerate() {
+        let selected = i == app.menu;
+        let marker = if selected { "  ▸ " } else { "    " };
+        let style = if selected {
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(Color::Gray)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, style),
+            Span::styled(*opt, style),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("       {note}"),
+            Style::new().fg(DIM),
+        )));
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        "  Either way, file names stay visible in a .zip.",
+        Style::new().fg(WARN),
+    )));
+    if let Some(note) = &app.note {
+        lines.push(Line::from(Span::styled(
+            format!("  {note}"),
+            Style::new().fg(WARN),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(body_block("Password"))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
 fn browse(frame: &mut Frame, area: Rect, app: &mut App) {
     let title = app.browser.cwd().to_string_lossy().into_owned();
     let items: Vec<ListItem> = app
@@ -166,11 +223,36 @@ fn browse(frame: &mut Frame, area: Rect, app: &mut App) {
         Flow::Encrypt => "Choose what to lock",
         Flow::Decrypt => "Choose a file to open",
     };
+
+    let block =
+        body_block(&title).title_bottom(Span::styled(format!(" {prompt} "), Style::new().fg(DIM)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // A query line above the list: a typed path to jump to, or a live filter.
+    let [query_area, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+    let query = app.browser.query();
+    let query_line = if query.is_empty() {
+        Line::from(Span::styled(
+            "  Type to filter, or paste a path",
+            Style::new().fg(DIM),
+        ))
+    } else {
+        let (tag, color) = if app.browser.is_path_query() {
+            ("Go to", OK)
+        } else {
+            ("Filter", ACCENT)
+        };
+        Line::from(vec![
+            Span::styled(format!("  {tag}: "), Style::new().fg(DIM)),
+            Span::styled(query.to_string(), Style::new().fg(color)),
+            Span::styled("▏", Style::new().fg(color)),
+        ])
+    };
+    frame.render_widget(Paragraph::new(query_line), query_area);
+
     let list = List::new(items)
-        .block(
-            body_block(&title)
-                .title_bottom(Span::styled(format!(" {prompt} "), Style::new().fg(DIM))),
-        )
         .highlight_style(
             Style::new()
                 .bg(ACCENT)
@@ -178,8 +260,7 @@ fn browse(frame: &mut Frame, area: Rect, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("");
-
-    frame.render_stateful_widget(list, area, app.browser.state());
+    frame.render_stateful_widget(list, list_area, app.browser.state());
 
     if let Some(note) = &app.note {
         note_overlay(frame, area, note);
@@ -242,14 +323,34 @@ fn review(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![Line::from("")];
     match app.flow {
         Flow::Encrypt => {
-            lines.push(heading("Ready to lock".into()));
+            let plain_zip = app.backend == Backend::Zip && app.password.is_empty();
+            lines.push(heading(if plain_zip {
+                "Ready to pack".into()
+            } else {
+                "Ready to lock".into()
+            }));
             lines.push(Line::from(""));
             lines.push(kv("From ", &source));
             lines.push(kv("To   ", &output));
             lines.push(kv("Using", app.backend.title()));
             lines.push(Line::from(""));
+            if plain_zip {
+                lines.push(Line::from(Span::styled(
+                    "  No password — anyone can open this file.",
+                    Style::new().fg(WARN),
+                )));
+            } else if app.backend == Backend::Zip {
+                lines.push(Line::from(Span::styled(
+                    "  File names stay visible in a .zip.",
+                    Style::new().fg(DIM),
+                )));
+            }
             lines.push(Line::from(Span::styled(
-                "  Press Enter to encrypt.",
+                if plain_zip {
+                    "  Press Enter to create the zip."
+                } else {
+                    "  Press Enter to encrypt."
+                },
                 Style::new().fg(OK).add_modifier(Modifier::BOLD),
             )));
         }

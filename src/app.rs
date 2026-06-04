@@ -13,7 +13,7 @@ use ratatui::DefaultTerminal;
 use crate::backend::{self, Backend};
 use crate::browser::{Action, Browser};
 
-const ARCHIVE_EXTS: &[&str] = &["age", "7z"];
+const ARCHIVE_EXTS: &[&str] = &["age", "7z", "zip"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flow {
@@ -24,6 +24,8 @@ pub enum Flow {
 pub enum Step {
     Welcome,
     ChooseBackend,
+    /// Only for the zip backend: protect with a password, or leave it open.
+    ZipProtect,
     Browse,
     Passphrase,
     Review,
@@ -42,6 +44,9 @@ pub struct App {
     pub step: Step,
     pub flow: Flow,
     pub backend: Backend,
+    /// For the zip backend: whether the user asked for a password (AES-256).
+    /// Always true for age/7z, which only exist in encrypted form.
+    pub protect: bool,
     pub menu: usize,
     pub browser: Browser,
     pub password: String,
@@ -63,6 +68,7 @@ impl App {
             step: Step::Welcome,
             flow: Flow::Encrypt,
             backend: Backend::Age,
+            protect: true,
             menu: 0,
             browser: Browser::new(home_dir(), None),
             password: String::new(),
@@ -104,6 +110,7 @@ impl App {
         match self.step {
             Step::Welcome => self.on_welcome(key.code),
             Step::ChooseBackend => self.on_choose_backend(key.code),
+            Step::ZipProtect => self.on_zip_protect(key.code),
             Step::Browse => self.on_browse(key.code),
             Step::Passphrase => self.on_passphrase(key),
             Step::Review => self.on_review(key.code),
@@ -139,14 +146,22 @@ impl App {
     fn on_choose_backend(&mut self, code: KeyCode) {
         match code {
             KeyCode::Up => self.menu = self.menu.saturating_sub(1),
-            KeyCode::Down => self.menu = (self.menu + 1).min(1),
+            KeyCode::Down => self.menu = (self.menu + 1).min(2),
             KeyCode::Esc => self.back_to_welcome(),
             KeyCode::Enter => {
-                let backend = if self.menu == 0 {
-                    Backend::Age
-                } else {
-                    Backend::SevenZip
+                let backend = match self.menu {
+                    0 => Backend::Age,
+                    1 => Backend::SevenZip,
+                    _ => Backend::Zip,
                 };
+                // Zip first asks whether to set a password; the install check
+                // happens once a protection choice is made.
+                if backend == Backend::Zip {
+                    self.backend = Backend::Zip;
+                    self.menu = 0;
+                    self.step = Step::ZipProtect;
+                    return;
+                }
                 if backend.locate().is_none() {
                     self.note = Some(format!(
                         "{} is not installed yet. {}",
@@ -156,6 +171,32 @@ impl App {
                     return;
                 }
                 self.backend = backend;
+                self.protect = true;
+                self.browser = Browser::new(home_dir(), None);
+                self.step = Step::Browse;
+            }
+            _ => {}
+        }
+    }
+
+    fn on_zip_protect(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Up => self.menu = self.menu.saturating_sub(1),
+            KeyCode::Down => self.menu = (self.menu + 1).min(1),
+            KeyCode::Esc => {
+                self.menu = 0;
+                self.step = Step::ChooseBackend;
+            }
+            KeyCode::Enter => {
+                if Backend::Zip.locate().is_none() {
+                    self.note = Some(format!(
+                        "{} is not installed yet. {}",
+                        Backend::Zip.title(),
+                        Backend::Zip.install_hint()
+                    ));
+                    return;
+                }
+                self.protect = self.menu == 0; // 0 = password, 1 = leave open
                 self.browser = Browser::new(home_dir(), None);
                 self.step = Step::Browse;
             }
@@ -167,17 +208,40 @@ impl App {
         match code {
             KeyCode::Up => self.browser.move_up(),
             KeyCode::Down => self.browser.move_down(),
-            KeyCode::Left | KeyCode::Backspace => self.browser.go_up(),
-            KeyCode::Esc => match self.flow {
-                Flow::Encrypt => {
-                    self.menu = 0;
-                    self.step = Step::ChooseBackend;
+            KeyCode::Left => self.browser.go_up(),
+            KeyCode::Char(c) => self.browser.push_query(c),
+            KeyCode::Backspace => {
+                if self.browser.query().is_empty() {
+                    self.browser.go_up();
+                } else {
+                    self.browser.pop_query();
                 }
-                Flow::Decrypt => self.back_to_welcome(),
-            },
+            }
+            KeyCode::Esc => {
+                if !self.browser.query().is_empty() {
+                    self.browser.clear_query();
+                } else {
+                    match self.flow {
+                        Flow::Encrypt => {
+                            self.menu = 0;
+                            self.step = Step::ChooseBackend;
+                        }
+                        Flow::Decrypt => self.back_to_welcome(),
+                    }
+                }
+            }
             KeyCode::Enter | KeyCode::Right => {
-                if let Action::Chosen(path) = self.browser.activate() {
-                    self.choose_path(path);
+                let action = if self.browser.is_path_query() {
+                    self.browser.resolve_query()
+                } else {
+                    self.browser.activate()
+                };
+                match action {
+                    Action::Chosen(path) => self.choose_path(path),
+                    Action::None if self.browser.is_path_query() => {
+                        self.note = Some("No file or folder at that path.".into());
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -185,10 +249,12 @@ impl App {
     }
 
     fn choose_path(&mut self, path: PathBuf) {
-        match self.flow {
+        let needs_password = match self.flow {
             Flow::Encrypt => {
                 self.output = Some(backend::suggested_output(&path, self.backend));
                 self.source = Some(path);
+                // A plain zip is the only encrypt path with no password.
+                self.backend != Backend::Zip || self.protect
             }
             Flow::Decrypt => {
                 match backend::backend_for(&path) {
@@ -209,13 +275,20 @@ impl App {
                     }
                 }
                 self.output = path.parent().map(|p| p.to_path_buf());
+                // A plain (unencrypted) zip opens without asking for a password.
+                let encrypted = backend::is_encrypted(&path).unwrap_or(true);
                 self.source = Some(path);
+                encrypted
             }
-        }
+        };
         self.password.clear();
         self.confirm.clear();
         self.field = Field::Password;
-        self.step = Step::Passphrase;
+        self.step = if needs_password {
+            Step::Passphrase
+        } else {
+            Step::Review
+        };
     }
 
     fn on_passphrase(&mut self, key: KeyEvent) {
@@ -386,6 +459,120 @@ mod tests {
         app.on_key(press(KeyCode::Enter));
         assert!(matches!(app.step, Step::Browse));
         assert_eq!(app.flow, Flow::Decrypt);
+    }
+
+    #[test]
+    fn browse_typing_builds_a_query_and_esc_clears_it() {
+        let mut app = App::new();
+        app.step = Step::Browse;
+        typed(&mut app, "ab");
+        assert_eq!(app.browser.query(), "ab");
+        app.on_key(press(KeyCode::Esc));
+        assert_eq!(app.browser.query(), "", "esc empties the query first");
+        assert!(
+            matches!(app.step, Step::Browse),
+            "esc with a query stays on the browse screen"
+        );
+    }
+
+    #[test]
+    fn browse_backspace_edits_query_before_leaving_folder() {
+        let mut app = App::new();
+        app.step = Step::Browse;
+        typed(&mut app, "ab");
+        app.on_key(press(KeyCode::Backspace));
+        assert_eq!(app.browser.query(), "a");
+    }
+
+    #[test]
+    fn choosing_zip_goes_to_the_protect_step() {
+        let mut app = App::new();
+        app.flow = Flow::Encrypt;
+        app.step = Step::ChooseBackend;
+        app.on_key(press(KeyCode::Down)); // 7z
+        app.on_key(press(KeyCode::Down)); // zip
+        app.on_key(press(KeyCode::Enter));
+        assert!(matches!(app.step, Step::ZipProtect));
+    }
+
+    #[test]
+    fn plain_zip_skips_the_password_step() {
+        let mut app = App::new();
+        app.flow = Flow::Encrypt;
+        app.backend = Backend::Zip;
+        app.protect = false;
+        app.choose_path(PathBuf::from("/tmp/docs"));
+        assert!(
+            matches!(app.step, Step::Review),
+            "a no-password zip goes straight to review"
+        );
+        assert!(app.password.is_empty());
+    }
+
+    #[test]
+    fn password_protected_zip_asks_for_a_password() {
+        let mut app = App::new();
+        app.flow = Flow::Encrypt;
+        app.backend = Backend::Zip;
+        app.protect = true;
+        app.choose_path(PathBuf::from("/tmp/docs"));
+        assert!(matches!(app.step, Step::Passphrase));
+    }
+
+    #[test]
+    fn zip_protect_no_password_choice_sets_protect_false() {
+        let mut app = App::new();
+        if Backend::Zip.locate().is_none() {
+            eprintln!("skipping: 7z backend not installed");
+            return;
+        }
+        app.backend = Backend::Zip;
+        app.step = Step::ZipProtect;
+        app.on_key(press(KeyCode::Down)); // "No password"
+        app.on_key(press(KeyCode::Enter));
+        assert!(matches!(app.step, Step::Browse));
+        assert!(!app.protect);
+    }
+
+    #[test]
+    fn opening_a_plain_zip_skips_the_password_step() {
+        if Backend::Zip.locate().is_none() {
+            eprintln!("skipping: 7z backend not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("docs");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.txt"), b"hi").unwrap();
+        let zip = dir.path().join("docs.zip");
+        backend::encrypt(Backend::Zip, &src, &zip, "").unwrap();
+
+        let mut app = App::new();
+        app.flow = Flow::Decrypt;
+        app.choose_path(zip);
+        assert!(
+            matches!(app.step, Step::Review),
+            "a plain zip opens without a password"
+        );
+    }
+
+    #[test]
+    fn opening_an_encrypted_zip_asks_for_a_password() {
+        if Backend::Zip.locate().is_none() {
+            eprintln!("skipping: 7z backend not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("docs");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.txt"), b"hi").unwrap();
+        let zip = dir.path().join("docs.zip");
+        backend::encrypt(Backend::Zip, &src, &zip, "s3cret").unwrap();
+
+        let mut app = App::new();
+        app.flow = Flow::Decrypt;
+        app.choose_path(zip);
+        assert!(matches!(app.step, Step::Passphrase));
     }
 
     #[test]
