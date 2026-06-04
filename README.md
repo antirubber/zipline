@@ -7,7 +7,8 @@ step-by-step wizard. No flags to remember, no crypto jargon. It wraps the
 trusted [`age`](https://github.com/FiloSottile/age) and
 [`7-Zip`](https://www.7-zip.org/) tools that ship in your distribution's
 package repositories, so there is no home-grown cryptography to trust. It can
-also write a plain or AES-256 `.zip` when you need a file that opens anywhere.
+also write a plain `.zip` when you just need a compressed file that opens
+anywhere.
 
 ## Install
 
@@ -32,57 +33,64 @@ zipline
 
 The wizard does the rest:
 
-**To lock something**
-1. Choose **Encrypt a file or folder**.
-2. Pick **Secure** (strongest), **Portable** (opens on Windows & Mac), or
-   **Compatible** (a `.zip` anyone can open). For a zip, choose whether to set
-   an AES-256 password or leave it open.
-3. Find the file or folder: arrow through the list, **type to filter** it, or
+**To protect or compress something**
+1. Choose **Protect or compress a file or folder**.
+2. Pick a method:
+   - **Lock with a password — age** (strongest, opens with zipline),
+   - **Lock with a password — 7z** (opens in 7-Zip / WinZip / Keka), or
+   - **Compress only — zip** (no password, opens anywhere).
+3. Choose a **compression level** (age offers None / Normal / Maximum; 7z and
+   zip take a level 0–9).
+4. Find the file or folder: arrow through the list, **type to filter** it, or
    **paste a full path** and press Enter to jump straight there.
-4. Type a password (twice) — skipped for a no-password zip.
-5. Done — you get one file next to the original.
+5. Type a password (twice) — skipped for zip, which never has one.
+6. Done — you get one file next to the original.
 
 **To open it again**
-1. Run `zipline` and choose **Open an encrypted file**.
+1. Run `zipline` and choose **Open an archive**.
 2. Browse to the `.age`, `.7z`, or `.zip` file (same filter / paste-a-path
    picker).
-3. Type the password. Your files are unpacked back out. A plain zip opens with
-   no password at all.
+3. Type the password if it needs one. Your files are unpacked back out. A
+   password-free zip opens with no prompt at all.
 
 > **Keep your password safe.** There is no recovery — without it, the file can
 > never be opened. That is the point.
 
-## Which protection should I pick?
+## Which method should I pick?
 
-| | Secure (age) | Portable (7z) | Compatible (zip) |
+| | age (strongest) | 7z (portable) | zip (compress only) |
 |---|---|---|---|
-| Strength | ChaCha20-Poly1305, authenticated | AES-256 | AES-256, or none |
-| Detects tampering / wrong password | yes | yes | wrong password, yes |
-| Hides file names | yes | yes | **no** |
-| Opens on Windows / macOS without zipline | no | yes (7-Zip, Keka) | yes |
-| Opens by double-click, no extra software | no | no | yes (plain zip) |
+| Password | yes | yes | **no** |
+| Strength | ChaCha20-Poly1305, authenticated | AES-256 | none |
+| Detects tampering / wrong password | yes | yes | n/a |
+| Hides file names | yes | yes | no |
+| Opens without zipline | no | yes (7-Zip / WinZip / Keka) | yes (anything) |
+| Opens by double-click, no extra software | no | no | **yes** |
 
-**Secure (age)** is the default and the strongest. It uses authenticated
-encryption, so a corrupted or tampered file is detected and reported in plain
-language instead of producing garbage. To keep file names and folder structure
-private, zipline streams everything through `tar` into a single `age` file —
-you only ever pick a folder; the plumbing stays hidden.
+**age** is the default and the strongest. It uses authenticated encryption, so a
+corrupted or tampered file is detected and reported in plain language instead of
+producing garbage. To keep file names and folder structure private, zipline
+streams everything through `tar` into a single `age` file — you only ever pick a
+folder; the plumbing stays hidden.
 
-Pick **Portable (7z)** when you need to send the file to someone on Windows or
-macOS who does not have zipline: a `.7z` opens in 7-Zip or Keka.
+Pick **7z** when you need to send a *password-protected* file to someone on
+Windows or macOS who does not have zipline: a `.7z` opens in 7-Zip, WinZip, or
+Keka.
 
-Pick **Compatible (zip)** for the widest reach — every operating system opens a
-`.zip` by double-clicking. You choose whether to set a password:
+Pick **zip** for the widest reach — every operating system opens a `.zip` by
+double-clicking, no extra software. A zip is **compress-only**: it has no
+password and does not protect the contents. If you need a password, use **age**
+or **7z**.
 
-- **No password** — just a plain, convenient archive. Not protected; anyone can
-  open it.
-- **AES-256 password** — the contents are scrambled. Opening it needs 7-Zip,
-  WinZip, or Keka and the password (the same reach as `.7z`, not Windows'
-  built-in unzip).
+> **Why no password-protected zip?** A zip's only universally-readable
+> encryption (ZipCrypto) is cryptographically broken, and strong AES-256 zips
+> only open in 7-Zip / WinZip / Keka — the same reach as `.7z`, but with file
+> names left visible. So zipline keeps zip for compatibility and sends
+> protection through age or 7z.
 
-> **The zip format cannot hide file names.** Even with a password, the list of
-> files inside stays readable. When names are sensitive, choose **Secure** or
-> **Portable**.
+Every method also asks for a **compression level**. Higher = smaller file but
+slower; lower = faster. age offers None / Normal / Maximum; 7z and zip take a
+number from 0 (store, no compression) to 9 (smallest).
 
 ## Building from source
 

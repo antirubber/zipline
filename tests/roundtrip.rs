@@ -64,7 +64,7 @@ fn roundtrip(backend: Backend) {
     let original = snapshot(&src);
 
     let out = backend::suggested_output(&src, backend);
-    backend::encrypt(backend, &src, &out, PASS).unwrap();
+    backend::encrypt(backend, &src, &out, PASS, 5).unwrap();
     assert!(
         out.exists(),
         "{} archive was not created",
@@ -94,12 +94,7 @@ fn sevenzip_roundtrip_preserves_files() {
 }
 
 #[test]
-fn encrypted_zip_roundtrip_preserves_files() {
-    roundtrip(Backend::Zip); // PASS is non-empty -> AES-256 zip
-}
-
-#[test]
-fn plain_zip_roundtrip_preserves_files() {
+fn zip_roundtrip_preserves_files_unencrypted() {
     if !available(Backend::Zip) {
         return;
     }
@@ -110,37 +105,16 @@ fn plain_zip_roundtrip_preserves_files() {
     let original = snapshot(&src);
 
     let out = backend::suggested_output(&src, Backend::Zip);
-    backend::encrypt(Backend::Zip, &src, &out, "").unwrap(); // empty -> plain zip
+    backend::encrypt(Backend::Zip, &src, &out, "", 5).unwrap(); // zip is compress-only
     assert!(out.exists());
     assert!(
         !backend::is_encrypted(&out).unwrap(),
-        "plain zip is not encrypted"
+        "zipline zips are never encrypted"
     );
 
     let dest = ws.path().join("restored");
     backend::decrypt(&out, &dest, "").unwrap();
     assert_eq!(original, snapshot(&dest.join("notes_and_photos")));
-}
-
-#[test]
-fn zip_rejects_wrong_password() {
-    let backend = Backend::Zip;
-    if !available(backend) {
-        return;
-    }
-    let ws = workspace();
-    let src = ws.path().join("stuff");
-    fs::create_dir_all(&src).unwrap();
-    fs::write(src.join("a.txt"), b"data\n").unwrap();
-    let out = backend::suggested_output(&src, backend);
-    backend::encrypt(backend, &src, &out, PASS).unwrap();
-
-    let dest = ws.path().join("out");
-    let err = backend::decrypt(&out, &dest, "the wrong password").unwrap_err();
-    assert!(
-        err.to_string().to_lowercase().contains("wrong password"),
-        "expected a wrong-password error, got: {err}"
-    );
 }
 
 #[test]
@@ -154,7 +128,7 @@ fn age_single_file_roundtrip() {
     fs::write(&src, b"dear diary, today i wrapped tar in age\n").unwrap();
 
     let out = backend::suggested_output(&src, backend);
-    backend::encrypt(backend, &src, &out, PASS).unwrap();
+    backend::encrypt(backend, &src, &out, PASS, 5).unwrap();
 
     let dest = ws.path().join("out");
     backend::decrypt(&out, &dest, PASS).unwrap();
@@ -174,7 +148,7 @@ fn age_hides_file_names() {
     fs::write(src.join("salary_negotiation.txt"), b"top secret\n").unwrap();
 
     let out = backend::suggested_output(&src, backend);
-    backend::encrypt(backend, &src, &out, PASS).unwrap();
+    backend::encrypt(backend, &src, &out, PASS, 5).unwrap();
 
     let cipher = fs::read(&out).unwrap();
     assert!(
@@ -198,7 +172,7 @@ fn age_rejects_wrong_password() {
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("a.txt"), b"data\n").unwrap();
     let out = backend::suggested_output(&src, backend);
-    backend::encrypt(backend, &src, &out, PASS).unwrap();
+    backend::encrypt(backend, &src, &out, PASS, 5).unwrap();
 
     let dest = ws.path().join("out");
     let err = backend::decrypt(&out, &dest, "the wrong password").unwrap_err();
@@ -219,7 +193,7 @@ fn sevenzip_rejects_wrong_password() {
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("a.txt"), b"data\n").unwrap();
     let out = backend::suggested_output(&src, backend);
-    backend::encrypt(backend, &src, &out, PASS).unwrap();
+    backend::encrypt(backend, &src, &out, PASS, 5).unwrap();
 
     let dest = ws.path().join("out");
     let err = backend::decrypt(&out, &dest, "the wrong password").unwrap_err();
@@ -241,9 +215,9 @@ fn reencrypting_same_target_is_idempotent() {
     fs::write(src.join("a.txt"), b"one\n").unwrap();
     let out = backend::suggested_output(&src, backend);
 
-    backend::encrypt(backend, &src, &out, PASS).unwrap();
+    backend::encrypt(backend, &src, &out, PASS, 5).unwrap();
     // Encrypt again over the same output; it must not merge or fail.
-    backend::encrypt(backend, &src, &out, PASS).unwrap();
+    backend::encrypt(backend, &src, &out, PASS, 5).unwrap();
 
     let dest = ws.path().join("out");
     backend::decrypt(&out, &dest, PASS).unwrap();
@@ -261,7 +235,7 @@ fn decrypt_does_not_overwrite_existing_folder() {
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("real.txt"), b"the original\n").unwrap();
     let out = backend::suggested_output(&src, backend);
-    backend::encrypt(backend, &src, &out, PASS).unwrap();
+    backend::encrypt(backend, &src, &out, PASS, 5).unwrap();
 
     // Decrypt into the *same* parent, where "project" already exists.
     let dest = src.parent().unwrap();
@@ -290,7 +264,7 @@ fn decrypt_returns_created_path() {
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("f.txt"), b"hi\n").unwrap();
     let out = backend::suggested_output(&src, backend);
-    backend::encrypt(backend, &src, &out, PASS).unwrap();
+    backend::encrypt(backend, &src, &out, PASS, 5).unwrap();
 
     let dest = ws.path().join("fresh");
     let produced = backend::decrypt(&out, &dest, PASS).unwrap();

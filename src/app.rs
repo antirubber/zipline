@@ -24,8 +24,8 @@ pub enum Flow {
 pub enum Step {
     Welcome,
     ChooseBackend,
-    /// Only for the zip backend: protect with a password, or leave it open.
-    ZipProtect,
+    /// Pick the compression level for the chosen method.
+    Compression,
     Browse,
     Passphrase,
     Review,
@@ -44,9 +44,12 @@ pub struct App {
     pub step: Step,
     pub flow: Flow,
     pub backend: Backend,
-    /// For the zip backend: whether the user asked for a password (AES-256).
-    /// Always true for age/7z, which only exist in encrypted form.
-    pub protect: bool,
+    /// Compression level 0–9 the job will use, fixed when leaving the
+    /// compression step.
+    pub level: u8,
+    /// The digit being typed on the compression step for 7z/zip (age uses a
+    /// preset menu via `menu` instead).
+    pub level_input: String,
     pub menu: usize,
     pub browser: Browser,
     pub password: String,
@@ -68,7 +71,8 @@ impl App {
             step: Step::Welcome,
             flow: Flow::Encrypt,
             backend: Backend::Age,
-            protect: true,
+            level: 5,
+            level_input: String::from("5"),
             menu: 0,
             browser: Browser::new(home_dir(), None),
             password: String::new(),
@@ -110,7 +114,7 @@ impl App {
         match self.step {
             Step::Welcome => self.on_welcome(key.code),
             Step::ChooseBackend => self.on_choose_backend(key.code),
-            Step::ZipProtect => self.on_zip_protect(key.code),
+            Step::Compression => self.on_compression(key.code),
             Step::Browse => self.on_browse(key.code),
             Step::Passphrase => self.on_passphrase(key),
             Step::Review => self.on_review(key.code),
@@ -154,14 +158,6 @@ impl App {
                     1 => Backend::SevenZip,
                     _ => Backend::Zip,
                 };
-                // Zip first asks whether to set a password; the install check
-                // happens once a protection choice is made.
-                if backend == Backend::Zip {
-                    self.backend = Backend::Zip;
-                    self.menu = 0;
-                    self.step = Step::ZipProtect;
-                    return;
-                }
                 if backend.locate().is_none() {
                     self.note = Some(format!(
                         "{} is not installed yet. {}",
@@ -171,37 +167,50 @@ impl App {
                     return;
                 }
                 self.backend = backend;
-                self.protect = true;
-                self.browser = Browser::new(home_dir(), None);
-                self.step = Step::Browse;
+                self.enter_compression();
             }
             _ => {}
         }
     }
 
-    fn on_zip_protect(&mut self, code: KeyCode) {
-        match code {
-            KeyCode::Up => self.menu = self.menu.saturating_sub(1),
-            KeyCode::Down => self.menu = (self.menu + 1).min(1),
-            KeyCode::Esc => {
-                self.menu = 0;
-                self.step = Step::ChooseBackend;
+    /// Set up the compression step: age picks from presets via `menu`, 7z/zip
+    /// type a level into `level_input`.
+    fn enter_compression(&mut self) {
+        self.menu = 0; // age: "None" preset highlighted
+        self.level_input = String::from("5"); // 7z/zip: "Normal"
+        self.step = Step::Compression;
+    }
+
+    fn on_compression(&mut self, code: KeyCode) {
+        if self.backend == Backend::Age {
+            match code {
+                KeyCode::Up => self.menu = self.menu.saturating_sub(1),
+                KeyCode::Down => self.menu = (self.menu + 1).min(2),
+                KeyCode::Esc => self.step = Step::ChooseBackend,
+                KeyCode::Enter => self.confirm_compression(),
+                _ => {}
             }
-            KeyCode::Enter => {
-                if Backend::Zip.locate().is_none() {
-                    self.note = Some(format!(
-                        "{} is not installed yet. {}",
-                        Backend::Zip.title(),
-                        Backend::Zip.install_hint()
-                    ));
-                    return;
-                }
-                self.protect = self.menu == 0; // 0 = password, 1 = leave open
-                self.browser = Browser::new(home_dir(), None);
-                self.step = Step::Browse;
+        } else {
+            // 7z / zip: type a single 0–9 digit (last one wins).
+            match code {
+                KeyCode::Char(c) if c.is_ascii_digit() => self.level_input = c.to_string(),
+                KeyCode::Backspace => self.level_input.clear(),
+                KeyCode::Esc => self.step = Step::ChooseBackend,
+                KeyCode::Enter => self.confirm_compression(),
+                _ => {}
             }
-            _ => {}
         }
+    }
+
+    /// Fix the compression level from the step's state and move on to browsing.
+    fn confirm_compression(&mut self) {
+        self.level = match self.backend {
+            // age presets: None / Normal / Maximum -> gzip 0 / 6 / 9.
+            Backend::Age => [0u8, 6, 9][self.menu.min(2)],
+            _ => self.level_input.trim().parse::<u8>().unwrap_or(5).min(9),
+        };
+        self.browser = Browser::new(home_dir(), None);
+        self.step = Step::Browse;
     }
 
     fn on_browse(&mut self, code: KeyCode) {
@@ -222,10 +231,7 @@ impl App {
                     self.browser.clear_query();
                 } else {
                     match self.flow {
-                        Flow::Encrypt => {
-                            self.menu = 0;
-                            self.step = Step::ChooseBackend;
-                        }
+                        Flow::Encrypt => self.step = Step::Compression,
                         Flow::Decrypt => self.back_to_welcome(),
                     }
                 }
@@ -253,8 +259,8 @@ impl App {
             Flow::Encrypt => {
                 self.output = Some(backend::suggested_output(&path, self.backend));
                 self.source = Some(path);
-                // A plain zip is the only encrypt path with no password.
-                self.backend != Backend::Zip || self.protect
+                // zip is compress-only; age and 7z always need a password.
+                self.backend != Backend::Zip
             }
             Flow::Decrypt => {
                 match backend::backend_for(&path) {
@@ -371,15 +377,15 @@ impl App {
         };
         let backend = self.backend;
         let flow = self.flow;
+        let level = self.level;
         let password = std::mem::take(&mut self.password);
         self.confirm.clear();
 
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let result = match flow {
-                Flow::Encrypt => {
-                    backend::encrypt(backend, &source, &output, &password).map(|()| output.clone())
-                }
+                Flow::Encrypt => backend::encrypt(backend, &source, &output, &password, level)
+                    .map(|()| output.clone()),
                 Flow::Decrypt => backend::decrypt(&source, &output, &password),
             };
             let _ = tx.send(result.map_err(|e| e.to_string()));
@@ -485,53 +491,83 @@ mod tests {
     }
 
     #[test]
-    fn choosing_zip_goes_to_the_protect_step() {
-        let mut app = App::new();
-        app.flow = Flow::Encrypt;
-        app.step = Step::ChooseBackend;
-        app.on_key(press(KeyCode::Down)); // 7z
-        app.on_key(press(KeyCode::Down)); // zip
-        app.on_key(press(KeyCode::Enter));
-        assert!(matches!(app.step, Step::ZipProtect));
+    fn choosing_any_backend_goes_to_compression() {
+        for (downs, backend) in [
+            (0usize, Backend::Age),
+            (1, Backend::SevenZip),
+            (2, Backend::Zip),
+        ] {
+            if backend.locate().is_none() {
+                continue; // skip an uninstalled backend
+            }
+            let mut app = App::new();
+            app.flow = Flow::Encrypt;
+            app.step = Step::ChooseBackend;
+            for _ in 0..downs {
+                app.on_key(press(KeyCode::Down));
+            }
+            app.on_key(press(KeyCode::Enter));
+            assert!(
+                matches!(app.step, Step::Compression),
+                "{backend:?} should lead to the compression step"
+            );
+        }
     }
 
     #[test]
-    fn plain_zip_skips_the_password_step() {
+    fn seven_zip_compression_accepts_a_typed_level() {
+        let mut app = App::new();
+        app.backend = Backend::SevenZip;
+        app.step = Step::Compression;
+        app.level_input = "5".into();
+        app.on_key(press(KeyCode::Char('9')));
+        app.confirm_compression();
+        assert_eq!(app.level, 9);
+        assert!(matches!(app.step, Step::Browse));
+    }
+
+    #[test]
+    fn seven_zip_compression_defaults_to_normal_when_blank() {
+        let mut app = App::new();
+        app.backend = Backend::SevenZip;
+        app.step = Step::Compression;
+        app.on_key(press(KeyCode::Backspace)); // clear the "5"
+        app.confirm_compression();
+        assert_eq!(app.level, 5, "blank entry falls back to Normal (5)");
+    }
+
+    #[test]
+    fn age_compression_presets_map_to_gzip_levels() {
+        for (menu, expected) in [(0u8, 0u8), (1, 6), (2, 9)] {
+            let mut app = App::new();
+            app.backend = Backend::Age;
+            app.step = Step::Compression;
+            app.menu = menu as usize;
+            app.confirm_compression();
+            assert_eq!(app.level, expected, "age preset {menu}");
+        }
+    }
+
+    #[test]
+    fn zip_skips_the_password_step() {
         let mut app = App::new();
         app.flow = Flow::Encrypt;
         app.backend = Backend::Zip;
-        app.protect = false;
         app.choose_path(PathBuf::from("/tmp/docs"));
         assert!(
             matches!(app.step, Step::Review),
-            "a no-password zip goes straight to review"
+            "zip is compress-only — straight to review"
         );
         assert!(app.password.is_empty());
     }
 
     #[test]
-    fn password_protected_zip_asks_for_a_password() {
+    fn age_asks_for_a_password() {
         let mut app = App::new();
         app.flow = Flow::Encrypt;
-        app.backend = Backend::Zip;
-        app.protect = true;
+        app.backend = Backend::Age;
         app.choose_path(PathBuf::from("/tmp/docs"));
         assert!(matches!(app.step, Step::Passphrase));
-    }
-
-    #[test]
-    fn zip_protect_no_password_choice_sets_protect_false() {
-        let mut app = App::new();
-        if Backend::Zip.locate().is_none() {
-            eprintln!("skipping: 7z backend not installed");
-            return;
-        }
-        app.backend = Backend::Zip;
-        app.step = Step::ZipProtect;
-        app.on_key(press(KeyCode::Down)); // "No password"
-        app.on_key(press(KeyCode::Enter));
-        assert!(matches!(app.step, Step::Browse));
-        assert!(!app.protect);
     }
 
     #[test]
@@ -545,7 +581,7 @@ mod tests {
         fs::create_dir(&src).unwrap();
         fs::write(src.join("a.txt"), b"hi").unwrap();
         let zip = dir.path().join("docs.zip");
-        backend::encrypt(Backend::Zip, &src, &zip, "").unwrap();
+        backend::encrypt(Backend::Zip, &src, &zip, "", 5).unwrap();
 
         let mut app = App::new();
         app.flow = Flow::Decrypt;
@@ -554,25 +590,6 @@ mod tests {
             matches!(app.step, Step::Review),
             "a plain zip opens without a password"
         );
-    }
-
-    #[test]
-    fn opening_an_encrypted_zip_asks_for_a_password() {
-        if Backend::Zip.locate().is_none() {
-            eprintln!("skipping: 7z backend not installed");
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("docs");
-        fs::create_dir(&src).unwrap();
-        fs::write(src.join("a.txt"), b"hi").unwrap();
-        let zip = dir.path().join("docs.zip");
-        backend::encrypt(Backend::Zip, &src, &zip, "s3cret").unwrap();
-
-        let mut app = App::new();
-        app.flow = Flow::Decrypt;
-        app.choose_path(zip);
-        assert!(matches!(app.step, Step::Passphrase));
     }
 
     #[test]
@@ -670,6 +687,47 @@ mod tests {
         assert_eq!(
             fs::read(dest.join("memo/note.txt")).unwrap(),
             b"wizard end to end\n"
+        );
+    }
+
+    #[test]
+    fn wizard_zip_flow_produces_a_plain_archive() {
+        if Backend::Zip.locate().is_none() {
+            eprintln!("skipping: 7z backend not installed");
+            return;
+        }
+        let ws = tempfile::tempdir().unwrap();
+        let src = ws.path().join("docs");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("a.txt"), b"plain data\n").unwrap();
+        let out = backend::suggested_output(&src, Backend::Zip);
+
+        let mut app = App::new();
+        app.flow = Flow::Encrypt;
+        app.step = Step::ChooseBackend;
+        app.on_key(press(KeyCode::Down));
+        app.on_key(press(KeyCode::Down));
+        app.on_key(press(KeyCode::Enter)); // zip -> Compression
+        assert!(matches!(app.step, Step::Compression));
+        app.on_key(press(KeyCode::Enter)); // accept default level -> Browse
+        assert!(matches!(app.step, Step::Browse));
+
+        app.choose_path(src.clone());
+        assert!(
+            matches!(app.step, Step::Review),
+            "zip needs no password — straight to review"
+        );
+        app.on_key(press(KeyCode::Enter)); // start_job
+        run_job_to_completion(&mut app);
+        assert!(
+            matches!(app.outcome, Some(Ok(_))),
+            "outcome: {:?}",
+            app.outcome
+        );
+        assert!(out.exists());
+        assert!(
+            !backend::is_encrypted(&out).unwrap(),
+            "zip must never be encrypted"
         );
     }
 

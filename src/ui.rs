@@ -32,7 +32,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     match app.step {
         Step::Welcome => welcome(frame, body, app),
         Step::ChooseBackend => choose_backend(frame, body, app),
-        Step::ZipProtect => zip_protect(frame, body, app),
+        Step::Compression => compression(frame, body, app),
         Step::Browse => browse(frame, body, app),
         Step::Passphrase => passphrase(frame, body, app),
         Step::Review => review(frame, body, app),
@@ -61,7 +61,13 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let hint = match app.step {
         Step::Welcome => "↑↓ choose · Enter select · q quit",
         Step::ChooseBackend => "↑↓ choose · Enter select · Esc back",
-        Step::ZipProtect => "↑↓ choose · Enter select · Esc back",
+        Step::Compression => {
+            if app.backend == Backend::Age {
+                "↑↓ choose · Enter select · Esc back"
+            } else {
+                "type 0–9 · Enter continue · Esc back"
+            }
+        }
         Step::Browse => "type to filter · paste a path · ↑↓ move · Enter open · ← up · Esc back",
         Step::Passphrase => match app.flow {
             Flow::Encrypt => "type password · Tab switch field · Enter continue · Esc back",
@@ -88,7 +94,11 @@ fn body_block(title: &str) -> Block<'_> {
 }
 
 fn welcome(frame: &mut Frame, area: Rect, app: &App) {
-    let options = ["Encrypt a file or folder", "Open an encrypted file", "Quit"];
+    let options = [
+        "Protect or compress a file or folder",
+        "Open an archive",
+        "Quit",
+    ];
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -102,16 +112,20 @@ fn welcome(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn choose_backend(frame: &mut Frame, area: Rect, app: &App) {
-    let options = ["Secure (age)", "Portable (7z)", "Compatible (zip)"];
+    let options = [
+        "Lock with a password — age (strongest)",
+        "Lock with a password — 7z (portable)",
+        "Compress only — zip (opens anywhere)",
+    ];
     let taglines = [
-        "Strongest protection. Opens with zipline on any Linux machine.",
-        "Opens in 7-Zip / Keka on Windows and macOS, without zipline.",
-        "Opens on any computer by double-clicking. Optional AES-256 password.",
+        "ChaCha20-Poly1305. Opens with zipline. Hides file names.",
+        "AES-256. Opens in 7-Zip / WinZip / Keka. Hides file names.",
+        "No password. Double-click on any OS. File names are visible.",
     ];
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "  How should it be protected?",
+            "  Choose a method",
             Style::new().fg(Color::Gray),
         )),
         Line::from(""),
@@ -126,7 +140,7 @@ fn choose_backend(frame: &mut Frame, area: Rect, app: &App) {
         };
         lines.push(Line::from(vec![
             Span::styled(marker, style),
-            Span::styled(format!("{opt:<16}"), style),
+            Span::styled(*opt, style),
         ]));
         lines.push(Line::from(Span::styled(
             format!("       {tag}"),
@@ -142,60 +156,49 @@ fn choose_backend(frame: &mut Frame, area: Rect, app: &App) {
     }
     frame.render_widget(
         Paragraph::new(lines)
-            .block(body_block("Protection"))
+            .block(body_block("Method"))
             .wrap(Wrap { trim: true }),
         area,
     );
 }
 
-fn zip_protect(frame: &mut Frame, area: Rect, app: &App) {
-    let options = [
-        "Protect with a password (AES-256)",
-        "No password — anyone can open it",
-    ];
-    let notes = [
-        "Scrambles the contents. Opens in 7-Zip / WinZip / Keka with the password.",
-        "Just a plain zip. Convenient to share, but not protected.",
-    ];
+fn compression(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "  Lock this zip with a password?",
+            "  How small should it be?",
             Style::new().fg(Color::Gray),
         )),
         Line::from(""),
     ];
-    for (i, (opt, note)) in options.iter().zip(notes).enumerate() {
-        let selected = i == app.menu;
-        let marker = if selected { "  ▸ " } else { "    " };
-        let style = if selected {
-            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
+    if app.backend == Backend::Age {
+        // age: three presets chosen with the arrow keys.
+        let options = [
+            "None — fastest, no shrinking",
+            "Normal",
+            "Maximum — smallest, slowest",
+        ];
+        lines.extend(menu_lines(&options, app.menu));
+    } else {
+        // 7z / zip: type a level 0–9.
+        let shown = if app.level_input.is_empty() {
+            "_".to_string()
         } else {
-            Style::new().fg(Color::Gray)
+            app.level_input.clone()
         };
         lines.push(Line::from(vec![
-            Span::styled(marker, style),
-            Span::styled(*opt, style),
+            Span::styled("  Level: ", Style::new().fg(Color::Gray)),
+            Span::styled(shown, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
         ]));
-        lines.push(Line::from(Span::styled(
-            format!("       {note}"),
-            Style::new().fg(DIM),
-        )));
         lines.push(Line::from(""));
-    }
-    lines.push(Line::from(Span::styled(
-        "  Either way, file names stay visible in a .zip.",
-        Style::new().fg(WARN),
-    )));
-    if let Some(note) = &app.note {
         lines.push(Line::from(Span::styled(
-            format!("  {note}"),
-            Style::new().fg(WARN),
+            "  0 = none (fastest)   5 = normal   9 = smallest (slowest)",
+            Style::new().fg(DIM),
         )));
     }
     frame.render_widget(
         Paragraph::new(lines)
-            .block(body_block("Password"))
+            .block(body_block("Compression"))
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -323,8 +326,8 @@ fn review(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![Line::from("")];
     match app.flow {
         Flow::Encrypt => {
-            let plain_zip = app.backend == Backend::Zip && app.password.is_empty();
-            lines.push(heading(if plain_zip {
+            let is_zip = app.backend == Backend::Zip;
+            lines.push(heading(if is_zip {
                 "Ready to pack".into()
             } else {
                 "Ready to lock".into()
@@ -333,20 +336,16 @@ fn review(frame: &mut Frame, area: Rect, app: &App) {
             lines.push(kv("From ", &source));
             lines.push(kv("To   ", &output));
             lines.push(kv("Using", app.backend.title()));
+            lines.push(kv("Squeeze", &compression_label(app.level)));
             lines.push(Line::from(""));
-            if plain_zip {
+            if is_zip {
                 lines.push(Line::from(Span::styled(
                     "  No password — anyone can open this file.",
                     Style::new().fg(WARN),
                 )));
-            } else if app.backend == Backend::Zip {
-                lines.push(Line::from(Span::styled(
-                    "  File names stay visible in a .zip.",
-                    Style::new().fg(DIM),
-                )));
             }
             lines.push(Line::from(Span::styled(
-                if plain_zip {
+                if is_zip {
                     "  Press Enter to create the zip."
                 } else {
                     "  Press Enter to encrypt."
@@ -487,6 +486,18 @@ fn kv(key: &str, value: &str) -> Line<'static> {
 
 fn mask(s: &str) -> String {
     "•".repeat(s.chars().count())
+}
+
+/// A plain-language name for a compression level, with the raw number.
+fn compression_label(level: u8) -> String {
+    let word = match level {
+        0 => "None",
+        1..=4 => "Faster",
+        5 => "Normal",
+        6..=8 => "Smaller",
+        _ => "Maximum",
+    };
+    format!("{word} ({level})")
 }
 
 fn path_str(p: &Option<std::path::PathBuf>) -> String {

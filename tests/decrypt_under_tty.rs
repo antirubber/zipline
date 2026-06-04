@@ -56,7 +56,7 @@ fn age_decrypt_works_under_a_controlling_terminal() {
     fs::write(src.join("note.txt"), b"controlling terminal regression\n").unwrap();
 
     let out = backend::suggested_output(&src, Backend::Age);
-    backend::encrypt(Backend::Age, &src, &out, PASS).unwrap();
+    backend::encrypt(Backend::Age, &src, &out, PASS, 5).unwrap();
 
     let dest = ws.path().join("restored");
     let status = Command::new(&helper)

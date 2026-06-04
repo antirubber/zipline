@@ -5,7 +5,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -17,8 +17,8 @@ pub enum Backend {
     Age,
     /// 7-Zip AES-256: opens in 7-Zip / Keka on Windows and macOS.
     SevenZip,
-    /// Zip: opens on any computer. Optionally AES-256 encrypted. The zip format
-    /// cannot hide file names — only the contents are protected.
+    /// Zip: compress-only, opens on any computer by double-click. zipline never
+    /// encrypts a zip — for a password, use age or 7z.
     Zip,
 }
 
@@ -43,7 +43,7 @@ impl Backend {
         match self {
             Backend::Age => "Strongest protection. Opens with zipline on any Linux machine.",
             Backend::SevenZip => "Opens in 7-Zip / Keka on Windows and macOS, without zipline.",
-            Backend::Zip => "Opens on any computer by double-clicking. Optional AES-256 password.",
+            Backend::Zip => "Compress only, no password. Opens on any computer by double-clicking.",
         }
     }
 
@@ -91,19 +91,28 @@ pub fn suggested_output(source: &Path, backend: Backend) -> PathBuf {
     parent.join(format!("{name}.{}", backend.extension()))
 }
 
-/// Encrypt `source` (a file or directory) into `output`, protected by
-/// `passphrase`. For age the contents are wrapped in a `tar` stream first so
-/// that file names and the directory layout stay confidential.
-pub fn encrypt(backend: Backend, source: &Path, output: &Path, passphrase: &str) -> Result<()> {
+/// Encrypt or pack `source` (a file or directory) into `output` at compression
+/// `level` (0 = none … 9 = smallest). age and 7z lock the result with
+/// `passphrase`; zip never encrypts and ignores it. For age the contents are
+/// wrapped in a `tar` stream first so that file names and the directory layout
+/// stay confidential.
+pub fn encrypt(
+    backend: Backend,
+    source: &Path,
+    output: &Path,
+    passphrase: &str,
+    level: u8,
+) -> Result<()> {
     let program = backend.program()?;
     if !source.exists() {
         bail!("{} does not exist", source.display());
     }
-    // An empty password means "plain zip" (no encryption); every other backend
-    // always encrypts, so a missing password there is a mistake.
+    // zip is compress-only; age and 7z always encrypt, so a missing password
+    // there is a mistake.
     if passphrase.is_empty() && backend != Backend::Zip {
         bail!("the password is empty");
     }
+    let level = level.min(9);
     // Both tools merge into an existing archive rather than replacing it, so
     // start from a clean slate to keep re-encrypting the same target idempotent.
     if output.exists() {
@@ -116,79 +125,115 @@ pub fn encrypt(backend: Backend, source: &Path, output: &Path, passphrase: &str)
 
     let (parent, name) = split(source)?;
 
-    // Run the chosen backend in a closure so every early `?` returns here, and
-    // a single place removes any partial output on failure.
-    let result = (|| -> Result<()> {
-        match backend {
-            Backend::Age => {
-                let mut tar = Command::new(tar_program()?)
-                    .arg("-cz")
-                    .arg("-C")
-                    .arg(&parent)
-                    .arg("--")
-                    .arg(&name)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .context("could not start tar")?;
-                let stream = tar
-                    .stdout
-                    .take()
-                    .ok_or_else(|| anyhow!("tar produced no output"))?;
-
-                let mut cmd = Command::new(&program);
-                cmd.arg("-p").arg("-o").arg(output);
-
-                let enc = pty::run(cmd, Input::Pipe(stream), passphrase, "passphrase", 2);
-                let tar_status = tar.wait().context("tar did not finish")?;
-                enc?;
-                if !tar_status.success() {
-                    bail!("could not read {}", source.display());
-                }
-                Ok(())
-            }
-            Backend::SevenZip => {
-                let mut cmd = Command::new(&program);
-                cmd.current_dir(&parent)
-                    .arg("a")
-                    .arg("-mhe=on")
-                    .arg("-mx=5")
-                    .arg("-p")
-                    .arg("-y")
-                    .arg("--")
-                    .arg(output)
-                    .arg(&name);
-                pty::run(cmd, Input::Tty, passphrase, "password", 2)
-            }
-            Backend::Zip => {
-                let mut cmd = Command::new(&program);
-                cmd.current_dir(&parent)
-                    .arg("a")
-                    .arg("-tzip")
-                    .arg("-mx=5")
-                    .arg("-y");
-                if passphrase.is_empty() {
-                    // Plain zip: no secret, so no pseudo-terminal is needed.
-                    cmd.arg("--").arg(output).arg(&name);
-                    run_quietly(cmd)
-                        .with_context(|| format!("could not create {}", output.display()))
-                } else {
-                    // Zip can only AES-encrypt the contents; names stay visible.
-                    cmd.arg("-mem=AES256")
-                        .arg("-p")
-                        .arg("--")
-                        .arg(output)
-                        .arg(&name);
-                    pty::run(cmd, Input::Tty, passphrase, "password", 2)
-                }
-            }
-        }
-    })();
-
+    // One place removes any partial output if the backend fails part-way.
+    let result = pack(backend, &program, &parent, &name, output, passphrase, level);
     if result.is_err() {
         cleanup(output);
     }
     result
+}
+
+/// Drive the chosen backend to produce `output`. Split out from `encrypt` so the
+/// caller's cleanup-on-failure stays in one spot.
+fn pack(
+    backend: Backend,
+    program: &Path,
+    parent: &Path,
+    name: &OsStr,
+    output: &Path,
+    passphrase: &str,
+    level: u8,
+) -> Result<()> {
+    match backend {
+        Backend::Age => age_encrypt(program, parent, name, output, passphrase, level),
+        Backend::SevenZip => {
+            let mut cmd = Command::new(program);
+            cmd.current_dir(parent)
+                .arg("a")
+                .arg("-mhe=on")
+                .arg(format!("-mx={level}"))
+                .arg("-p")
+                .arg("-y")
+                .arg("--")
+                .arg(output)
+                .arg(name);
+            pty::run(cmd, Input::Tty, passphrase, "password", 2)
+        }
+        Backend::Zip => {
+            // Compress-only: no secret, so no pseudo-terminal is needed.
+            let mut cmd = Command::new(program);
+            cmd.current_dir(parent)
+                .arg("a")
+                .arg("-tzip")
+                .arg(format!("-mx={level}"))
+                .arg("-y")
+                .arg("--")
+                .arg(output)
+                .arg(name);
+            run_quietly(cmd).with_context(|| format!("could not create {}", output.display()))
+        }
+    }
+}
+
+/// Stream `name` through `tar` (optionally `gzip -level`) into `age -p`. A
+/// `level` of 0 skips compression entirely. age refuses a passphrase on stdin,
+/// so it is driven through a pseudo-terminal while the archive arrives on its
+/// stdin pipe.
+fn age_encrypt(
+    program: &Path,
+    parent: &Path,
+    name: &OsStr,
+    output: &Path,
+    passphrase: &str,
+    level: u8,
+) -> Result<()> {
+    let mut tar = Command::new(tar_program()?)
+        .arg("-c")
+        .arg("-C")
+        .arg(parent)
+        .arg("--")
+        .arg(name)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("could not start tar")?;
+    let tar_out = tar
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("tar produced no output"))?;
+
+    // Optionally interpose gzip at the requested level.
+    let (stream, mut gzip): (ChildStdout, Option<Child>) = if level == 0 {
+        (tar_out, None)
+    } else {
+        let mut gz = Command::new(gzip_program()?)
+            .arg(format!("-{level}"))
+            .stdin(Stdio::from(tar_out))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("could not start gzip")?;
+        let gz_out = gz
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("gzip produced no output"))?;
+        (gz_out, Some(gz))
+    };
+
+    let mut cmd = Command::new(program);
+    cmd.arg("-p").arg("-o").arg(output);
+    let enc = pty::run(cmd, Input::Pipe(stream), passphrase, "passphrase", 2);
+
+    let tar_status = tar.wait().context("tar did not finish")?;
+    let gzip_ok = match gzip.as_mut() {
+        Some(gz) => gz.wait().context("gzip did not finish")?.success(),
+        None => true,
+    };
+    enc?;
+    if !tar_status.success() || !gzip_ok {
+        bail!("could not read {}", parent.join(name).display());
+    }
+    Ok(())
 }
 
 /// Decrypt `archive`, recreating the original file or folder inside `dest`
@@ -482,6 +527,10 @@ fn tar_program() -> Result<PathBuf> {
     which("tar").ok_or_else(|| anyhow!("the 'tar' tool is not installed"))
 }
 
+fn gzip_program() -> Result<PathBuf> {
+    which("gzip").ok_or_else(|| anyhow!("the 'gzip' tool is not installed"))
+}
+
 /// Find an executable named `name` on `PATH`.
 pub fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -548,6 +597,28 @@ mod tests {
         true
     }
 
+    /// Craft a password-protected AES-256 zip with 7-Zip directly (inline `-p`,
+    /// no terminal needed). zipline itself no longer creates these, but it must
+    /// still open one made by another tool.
+    fn make_aes_zip(parent: &Path, name: &str, out: &Path, pass: &str) {
+        let program = Backend::Zip.locate().unwrap();
+        let status = Command::new(program)
+            .current_dir(parent)
+            .arg("a")
+            .arg("-tzip")
+            .arg("-mem=AES256")
+            .arg(format!("-p{pass}"))
+            .arg("-y")
+            .arg("--")
+            .arg(out)
+            .arg(name)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "could not craft test AES zip");
+    }
+
     #[test]
     fn plain_zip_roundtrip_preserves_files() {
         if !seven_zip_available() {
@@ -560,8 +631,12 @@ mod tests {
 
         let out = suggested_output(&src, Backend::Zip);
         assert_eq!(out, dir.path().join("docs.zip"));
-        encrypt(Backend::Zip, &src, &out, "").unwrap(); // empty password = plain zip
+        encrypt(Backend::Zip, &src, &out, "", 5).unwrap(); // zip is compress-only
         assert!(out.exists());
+        assert!(
+            !is_encrypted(&out).unwrap(),
+            "zipline zips are never encrypted"
+        );
 
         let dest = dir.path().join("restored");
         decrypt(&out, &dest, "").unwrap();
@@ -569,7 +644,29 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_zip_roundtrip_preserves_files() {
+    fn store_level_zip_does_not_compress() {
+        if !seven_zip_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("docs");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("a.txt"), vec![b'a'; 4096]).unwrap();
+
+        let stored = dir.path().join("stored.zip");
+        encrypt(Backend::Zip, &src, &stored, "", 0).unwrap();
+        let smallest = dir.path().join("smallest.zip");
+        encrypt(Backend::Zip, &src, &smallest, "", 9).unwrap();
+
+        // Highly compressible input: max level must beat store.
+        assert!(
+            fs::metadata(&smallest).unwrap().len() < fs::metadata(&stored).unwrap().len(),
+            "level 9 should be smaller than level 0 for compressible data"
+        );
+    }
+
+    #[test]
+    fn decrypts_an_externally_made_aes_zip() {
         if !seven_zip_available() {
             return;
         }
@@ -577,9 +674,8 @@ mod tests {
         let src = dir.path().join("docs");
         fs::create_dir(&src).unwrap();
         fs::write(src.join("a.txt"), b"top secret").unwrap();
-
         let out = dir.path().join("docs.zip");
-        encrypt(Backend::Zip, &src, &out, "s3cret").unwrap();
+        make_aes_zip(dir.path(), "docs", &out, "s3cret");
 
         let dest = dir.path().join("restored");
         decrypt(&out, &dest, "s3cret").unwrap();
@@ -596,7 +692,7 @@ mod tests {
         fs::create_dir(&src).unwrap();
         fs::write(src.join("a.txt"), b"top secret").unwrap();
         let out = dir.path().join("docs.zip");
-        encrypt(Backend::Zip, &src, &out, "right").unwrap();
+        make_aes_zip(dir.path(), "docs", &out, "right");
 
         let dest = dir.path().join("restored");
         let err = decrypt(&out, &dest, "wrong").unwrap_err();
@@ -614,11 +710,11 @@ mod tests {
         fs::write(src.join("a.txt"), b"hello").unwrap();
 
         let plain = dir.path().join("plain.zip");
-        encrypt(Backend::Zip, &src, &plain, "").unwrap();
+        encrypt(Backend::Zip, &src, &plain, "", 5).unwrap();
         assert!(!is_encrypted(&plain).unwrap(), "plain zip is not encrypted");
 
         let locked = dir.path().join("locked.zip");
-        encrypt(Backend::Zip, &src, &locked, "s3cret").unwrap();
+        make_aes_zip(dir.path(), "docs", &locked, "s3cret");
         assert!(is_encrypted(&locked).unwrap(), "AES zip is encrypted");
     }
 
