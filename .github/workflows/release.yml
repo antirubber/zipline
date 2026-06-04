@@ -20,7 +20,7 @@ jobs:
           - target: aarch64-unknown-linux-musl
             asset: zipline-linux-arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -33,7 +33,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/zipline" "${{ matrix.asset }}"
           sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
       - name: Attach to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             ${{ matrix.asset }}
