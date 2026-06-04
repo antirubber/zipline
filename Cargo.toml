@@ -1,0 +1,30 @@
+[package]
+name = "zipline"
+version = "0.1.0"
+edition = "2021"
+description = "A friendly terminal wizard that encrypts your files and folders with one password."
+license = "MIT"
+repository = "https://github.com/antirubber/zipline"
+readme = "README.md"
+rust-version = "1.76"
+
+[[bin]]
+name = "zipline"
+path = "src/main.rs"
+
+[lib]
+name = "zipline"
+path = "src/lib.rs"
+
+[dependencies]
+ratatui = "0.30"
+nix = { version = "0.31", features = ["term"] }
+libc = "0.2"
+tempfile = "3"
+anyhow = "1"
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1
