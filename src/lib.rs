@@ -3,6 +3,7 @@ pub mod backend;
 pub mod browser;
 pub mod pty;
 pub mod ui;
+pub mod update;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

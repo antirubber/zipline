@@ -5,6 +5,7 @@ zipline — lock your files with one password
 
 Usage:
   zipline            Start the wizard (encrypt or open a file/folder)
+  zipline update     Update to the latest release
   zipline --version  Print the version
   zipline --help     Show this message
 
@@ -22,6 +23,13 @@ fn main() -> ExitCode {
             println!("{HELP}");
             ExitCode::SUCCESS
         }
+        Some("update") => match zipline::update::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("zipline: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Some(other) => {
             eprintln!("zipline: unknown option '{other}'\nTry 'zipline --help'.");
             ExitCode::FAILURE
