@@ -48,8 +48,6 @@ pub fn run(
     let master: OwnedFd = pty.master;
     let slave: OwnedFd = pty.slave;
 
-    let needs_ctty = matches!(input, Input::Pipe(_));
-
     match input {
         Input::Tty => {
             cmd.stdin(Stdio::from(slave.try_clone().context("dup pty")?));
@@ -61,20 +59,18 @@ pub fn run(
     cmd.stdout(Stdio::from(slave.try_clone().context("dup pty")?));
     cmd.stderr(Stdio::from(slave.try_clone().context("dup pty")?));
 
-    // When stdin is a data pipe the child cannot prompt on stdin, so we make
-    // the pty slave its controlling terminal in a fresh session; `/dev/tty`
-    // then resolves to our pty.
-    let ctty_fd: Option<OwnedFd> = if needs_ctty {
-        Some(
-            slave
-                .try_clone()
-                .context("dup pty for controlling terminal")?,
-        )
-    } else {
-        None
-    };
-    if let Some(dup) = ctty_fd.as_ref() {
-        let raw = dup.as_raw_fd();
+    // `age` reads its passphrase from `/dev/tty`, never stdin, even when stdin
+    // is already a terminal — so we always put the child in a fresh session
+    // with the pty slave as its controlling terminal. `/dev/tty` then resolves
+    // to our pty no matter how stdin is wired. Without this the decrypt path
+    // (stdin = our pty) still let age's prompt escape to the real terminal,
+    // where we never saw it and timed out. Tools that read from stdin (7z) are
+    // unaffected.
+    let ctty_fd: OwnedFd = slave
+        .try_clone()
+        .context("dup pty for controlling terminal")?;
+    {
+        let raw = ctty_fd.as_raw_fd();
         unsafe {
             cmd.pre_exec(move || {
                 if libc::setsid() == -1 {
