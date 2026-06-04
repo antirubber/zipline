@@ -94,11 +94,7 @@ fn body_block(title: &str) -> Block<'_> {
 }
 
 fn welcome(frame: &mut Frame, area: Rect, app: &App) {
-    let options = [
-        "Protect or compress a file or folder",
-        "Open an archive",
-        "Quit",
-    ];
+    let options = ["Create", "Extract", "Quit"];
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -112,15 +108,24 @@ fn welcome(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn choose_backend(frame: &mut Frame, area: Rect, app: &App) {
-    let options = [
-        "Lock with a password — age (strongest)",
-        "Lock with a password — 7z (portable)",
-        "Compress only — zip (opens anywhere)",
-    ];
-    let taglines = [
-        "ChaCha20-Poly1305. Opens with zipline. Hides file names.",
-        "AES-256. Opens in 7-Zip / WinZip / Keka. Hides file names.",
-        "No password. Double-click on any OS. File names are visible.",
+    // (method name, rest of the title, tagline). The name is rendered bold on
+    // every row so the format — age / 7z / zip — is what the eye lands on.
+    let methods = [
+        (
+            "age",
+            " — Encrypt · strongest",
+            "ChaCha20-Poly1305. Opens with zipline. Hides file names.",
+        ),
+        (
+            "7z",
+            " — Encrypt · portable",
+            "AES-256. Opens in 7-Zip / WinZip / Keka. Hides file names.",
+        ),
+        (
+            "zip",
+            " — No encryption · opens anywhere",
+            "No password. Double-click on any OS. File names are visible.",
+        ),
     ];
     let mut lines = vec![
         Line::from(""),
@@ -130,17 +135,25 @@ fn choose_backend(frame: &mut Frame, area: Rect, app: &App) {
         )),
         Line::from(""),
     ];
-    for (i, (opt, tag)) in options.iter().zip(taglines).enumerate() {
+    for (i, (name, rest, tag)) in methods.iter().enumerate() {
         let selected = i == app.menu;
         let marker = if selected { "  ▸ " } else { "    " };
-        let style = if selected {
+        let line_style = if selected {
             Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
         } else {
             Style::new().fg(Color::Gray)
         };
+        // Off-row, the name stands out from the gray rest by going white-bold;
+        // on the selected row the whole line is already accent-bold.
+        let name_style = if selected {
+            line_style
+        } else {
+            Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
+        };
         lines.push(Line::from(vec![
-            Span::styled(marker, style),
-            Span::styled(*opt, style),
+            Span::styled(marker, line_style),
+            Span::styled(format!("{name:<3}"), name_style),
+            Span::styled(*rest, line_style),
         ]));
         lines.push(Line::from(Span::styled(
             format!("       {tag}"),
@@ -224,7 +237,7 @@ fn browse(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let prompt = match app.flow {
         Flow::Encrypt => "Choose what to lock",
-        Flow::Decrypt => "Choose a file to open",
+        Flow::Decrypt => "Choose a file to extract",
     };
 
     let block =
@@ -354,13 +367,13 @@ fn review(frame: &mut Frame, area: Rect, app: &App) {
             )));
         }
         Flow::Decrypt => {
-            lines.push(heading("Ready to open".into()));
+            lines.push(heading("Ready to extract".into()));
             lines.push(Line::from(""));
             lines.push(kv("File", &source));
             lines.push(kv("Into", &output));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "  Press Enter to open.",
+                "  Press Enter to extract.",
                 Style::new().fg(OK).add_modifier(Modifier::BOLD),
             )));
         }

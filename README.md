@@ -92,6 +92,28 @@ Every method also asks for a **compression level**. Higher = smaller file but
 slower; lower = faster. age offers None / Normal / Maximum; 7z and zip take a
 number from 0 (store, no compression) to 9 (smallest).
 
+## Troubleshooting
+
+**A password-protected `.7z` lists in xarchiver but won't extract.** This is a
+bug in **xarchiver** (the default archive manager on Debian/XFCE), not in the
+file. xarchiver passes `-spd` to suppress 7-Zip's password prompt but fails to
+forward your password to the extract command, so it dies silently. xarchiver is
+only thinly maintained (one volunteer), and this bug is open and unfixed;
+header-encrypted (`-mhe=on`) 7z archives are
+[acknowledged as broken upstream](https://bugs.debian.org/959914).
+
+The archive itself is standard `LZMA2 + AES-256` and extracts everywhere else.
+On Linux, open it with any of:
+
+```sh
+7z x archive.7z      # the 7-Zip CLI prompts for the password
+```
+
+or a working GUI — **Ark** (`sudo apt install ark`) or **file-roller**
+(`sudo apt install file-roller`), both of which prompt correctly. On Windows
+(7-Zip / WinRAR) and macOS (Keka) it just works. For Linux-to-Linux transfers,
+**age** sidesteps the whole issue.
+
 ## Building from source
 
 ```sh

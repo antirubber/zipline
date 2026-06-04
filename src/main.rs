@@ -10,8 +10,8 @@ Usage:
   zipline --help     Show this message
 
 The wizard walks you through everything: pick a file or folder, choose a
-password, and zipline encrypts it. To open an encrypted file later, run
-zipline again and choose \"Open an encrypted file\".";
+password, and zipline encrypts it. To unpack a file later, run zipline again
+and choose \"Extract\".";
 
 fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
