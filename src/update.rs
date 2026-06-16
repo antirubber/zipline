@@ -12,13 +12,22 @@ use anyhow::{bail, Context, Result};
 
 use crate::backend::which;
 
-const INSTALLER_URL: &str = "https://raw.githubusercontent.com/antirubber/zipline/main/install.sh";
+/// The installer is fetched at the *installed* version's immutable release tag
+/// rather than the mutable `main` branch, so tampering with `main` can't hijack
+/// an `update`. That tagged installer still resolves and installs the latest
+/// release (the binary it downloads is checksum-verified separately).
+fn installer_url() -> String {
+    format!(
+        "https://raw.githubusercontent.com/antirubber/zipline/v{}/install.sh",
+        crate::VERSION
+    )
+}
 
 /// The shell pipeline that downloads and runs the installer. `pipefail` makes a
 /// failed download surface as a failure instead of feeding `bash` empty input
 /// (which would otherwise exit 0 and look like success).
 fn installer_pipeline() -> String {
-    format!("set -o pipefail; curl -fsSL {INSTALLER_URL} | bash")
+    format!("set -o pipefail; curl -fsSL {} | bash", installer_url())
 }
 
 pub fn run() -> Result<()> {
@@ -29,7 +38,7 @@ pub fn run() -> Result<()> {
         bail!("bash is required to update; install it and try again");
     }
 
-    println!("Updating zipline from {INSTALLER_URL}\n");
+    println!("Updating zipline from {}\n", installer_url());
     let status = Command::new("bash")
         .arg("-c")
         .arg(installer_pipeline())
@@ -47,12 +56,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pipeline_pulls_the_repo_installer_with_pipefail() {
+    fn pipeline_pins_the_installer_to_the_release_tag() {
         let p = installer_pipeline();
         assert!(p.contains("set -o pipefail"), "missing pipefail guard: {p}");
         assert!(
-            p.contains("raw.githubusercontent.com/antirubber/zipline/main/install.sh"),
-            "wrong installer URL: {p}"
+            p.contains(&format!(
+                "raw.githubusercontent.com/antirubber/zipline/v{}/install.sh",
+                crate::VERSION
+            )),
+            "installer not pinned to the release tag: {p}"
+        );
+        assert!(
+            !p.contains("/main/"),
+            "installer must not be pulled from mutable main: {p}"
         );
         assert!(p.contains("| bash"), "installer is not piped to bash: {p}");
     }

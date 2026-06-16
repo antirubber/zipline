@@ -34,20 +34,23 @@ zipline
 The wizard does the rest:
 
 **To protect or compress something**
-1. Choose **Protect or compress a file or folder**.
+1. Choose **Lock or compress a file**.
 2. Pick a method:
    - **Lock with a password — age** (strongest, opens with zipline),
    - **Lock with a password — 7z** (opens in 7-Zip / WinZip / Keka), or
    - **Compress only — zip** (no password, opens anywhere).
 3. Choose a **compression level** (age offers None / Normal / Maximum; 7z and
    zip take a level 0–9).
-4. Find the file or folder: arrow through the list, **type to filter** it, or
-   **paste a full path** and press Enter to jump straight there.
-5. Type a password (twice) — skipped for zip, which never has one.
+4. Find the file or folder: arrow through the list, **type to filter** it,
+   **paste a full path** and press Enter to jump straight there, or press
+   **Tab** to show hidden (dot) files.
+5. Type a password (twice) — skipped for zip, which never has one. Press
+   **Ctrl-R** to reveal what you typed, and you'll be warned before replacing an
+   existing file.
 6. Done — you get one file next to the original.
 
 **To open it again**
-1. Run `zipline` and choose **Open an archive**.
+1. Run `zipline` and choose **Open a locked file**.
 2. Browse to the `.age`, `.7z`, or `.zip` file (same filter / paste-a-path
    picker).
 3. Type the password if it needs one. Your files are unpacked back out. A
@@ -55,6 +58,27 @@ The wizard does the rest:
 
 > **Keep your password safe.** There is no recovery — without it, the file can
 > never be opened. That is the point.
+
+### Lock for a person (no shared password)
+
+When you pick **age**, you can choose **Lock for a person** instead of a
+password. Paste the recipient's age public key (`age1…`) or point at their key
+file, and only their matching key opens the file — there is no password to share
+over the phone. To open one sent to you, browse to it, then press **Ctrl-K** on
+the password screen to choose your own key file.
+
+### From a script
+
+`lock` and `open` do the same thing without the wizard, prompting for the
+password on the terminal (never a flag, so it stays out of `ps` and your shell
+history):
+
+```sh
+zipline lock ~/Photos --backend age --level 9      # writes ~/Photos.age
+zipline open ~/Photos.age --out ~/Restored
+```
+
+`zipline doctor` reports which helper tools are installed.
 
 ## Which method should I pick?
 
@@ -93,6 +117,10 @@ slower; lower = faster. age offers None / Normal / Maximum; 7z and zip take a
 number from 0 (store, no compression) to 9 (smallest).
 
 ## Troubleshooting
+
+**Check your setup.** Run `zipline doctor` to see which helper tools
+(`age`, `7z`, `tar`, `gzip`) zipline can find, with the install command for any
+that are missing.
 
 **A password-protected `.7z` lists in xarchiver but won't extract.** This is a
 bug in **xarchiver** (the default archive manager on Debian/XFCE), not in the

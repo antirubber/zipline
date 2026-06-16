@@ -118,6 +118,61 @@ fn zip_roundtrip_preserves_files_unencrypted() {
 }
 
 #[test]
+fn age_recipient_roundtrip_preserves_files() {
+    if !available(Backend::Age) {
+        return;
+    }
+    let keygen = match backend::which("age-keygen") {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: age-keygen not installed");
+            return;
+        }
+    };
+
+    let ws = workspace();
+    let key = ws.path().join("id.txt");
+    let status = std::process::Command::new(&keygen)
+        .arg("-o")
+        .arg(&key)
+        .status()
+        .unwrap();
+    assert!(status.success(), "age-keygen failed");
+    // The identity file carries the matching public key as a comment line.
+    let contents = fs::read(&key).unwrap();
+    let text = String::from_utf8_lossy(&contents);
+    let pubkey = text
+        .lines()
+        .find_map(|l| l.strip_prefix("# public key: "))
+        .expect("age-keygen wrote no public key line")
+        .trim()
+        .to_string();
+
+    let src = ws.path().join("docs");
+    fs::create_dir_all(&src).unwrap();
+    sample_tree(&src);
+    let original = snapshot(&src);
+
+    let out = ws.path().join("docs.age");
+    backend::encrypt_for_recipients(&src, &out, &[pubkey], 5).unwrap();
+    assert!(out.exists(), "recipient archive was not created");
+
+    // A passphrase cannot open a recipient-encrypted archive; the identity can.
+    assert!(
+        backend::decrypt(&out, &ws.path().join("nope"), "anything").is_err(),
+        "recipient archive should not open with a passphrase"
+    );
+
+    let dest = ws.path().join("restored");
+    backend::decrypt_with_identity(&out, &dest, &key).unwrap();
+    assert_eq!(
+        original,
+        snapshot(&dest.join("docs")),
+        "recipient round-trip changed the files"
+    );
+}
+
+#[test]
 fn age_single_file_roundtrip() {
     let backend = Backend::Age;
     if !available(backend) {
@@ -270,6 +325,78 @@ fn decrypt_returns_created_path() {
     let produced = backend::decrypt(&out, &dest, PASS).unwrap();
     assert_eq!(produced, dest.join("folder"));
     assert_eq!(fs::read(produced.join("f.txt")).unwrap(), b"hi\n");
+}
+
+/// A password that literally contains the backend's prompt marker word
+/// ("passphrase" for age, "password" for 7z) must still round-trip. With echo
+/// suppressed the pty driver never rematches an echoed copy and double-sends;
+/// this is the regression guard for that fix.
+fn marker_in_password_roundtrips(backend: Backend, password: &str) {
+    if !available(backend) {
+        return;
+    }
+    let ws = workspace();
+    let src = ws.path().join("docs");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), b"marker test\n").unwrap();
+    let out = backend::suggested_output(&src, backend);
+    backend::encrypt(backend, &src, &out, password, 5).unwrap();
+
+    let dest = ws.path().join("out");
+    backend::decrypt(&out, &dest, password).unwrap();
+    assert_eq!(
+        fs::read(dest.join("docs/a.txt")).unwrap(),
+        b"marker test\n",
+        "{} round-trip with a marker-bearing password failed",
+        backend.extension()
+    );
+}
+
+#[test]
+fn age_password_containing_marker_roundtrips() {
+    marker_in_password_roundtrips(Backend::Age, "my passphrase is strong");
+}
+
+#[test]
+fn sevenzip_password_containing_marker_roundtrips() {
+    marker_in_password_roundtrips(Backend::SevenZip, "my password is strong");
+}
+
+#[test]
+fn cli_zip_lock_and_open_roundtrip() {
+    // zip needs no password, so the CLI path runs end-to-end without a terminal.
+    if !available(Backend::Zip) {
+        return;
+    }
+    let ws = workspace();
+    let src = ws.path().join("docs");
+    fs::create_dir_all(&src).unwrap();
+    sample_tree(&src);
+    let original = snapshot(&src);
+
+    let out = ws.path().join("docs.zip");
+    zipline::cli::lock(&[
+        src.to_str().unwrap().to_string(),
+        "--backend".into(),
+        "zip".into(),
+        "--out".into(),
+        out.to_str().unwrap().to_string(),
+    ])
+    .unwrap();
+    assert!(out.exists(), "cli lock did not produce the zip");
+
+    let dest = ws.path().join("restored");
+    zipline::cli::open(&[
+        out.to_str().unwrap().to_string(),
+        "--out".into(),
+        dest.to_str().unwrap().to_string(),
+    ])
+    .unwrap();
+    assert_eq!(
+        original,
+        snapshot(&dest.join("docs")),
+        "cli lock/open round-trip changed the files"
+    );
 }
 
 #[test]

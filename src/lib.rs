@@ -1,6 +1,7 @@
 pub mod app;
 pub mod backend;
 pub mod browser;
+pub mod cli;
 pub mod pty;
 pub mod ui;
 pub mod update;

@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, Field, Flow, Step};
+use crate::app::{AgeMethod, App, Field, Flow, Step};
 use crate::backend::Backend;
 use crate::browser::Row;
 
@@ -32,9 +32,26 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     match app.step {
         Step::Welcome => welcome(frame, body, app),
         Step::ChooseBackend => choose_backend(frame, body, app),
+        Step::AgeMethod => age_method(frame, body, app),
         Step::Compression => compression(frame, body, app),
         Step::Browse => browse(frame, body, app),
+        Step::Recipient => text_entry(
+            frame,
+            body,
+            app,
+            "Recipient",
+            "Who is this file for?",
+            "Paste their age public key (age1…), or a path to their key file.",
+        ),
         Step::Passphrase => passphrase(frame, body, app),
+        Step::Identity => text_entry(
+            frame,
+            body,
+            app,
+            "Key file",
+            "Open with your age key",
+            "Type the path to your age key file (e.g. ~/key.txt).",
+        ),
         Step::Review => review(frame, body, app),
         Step::Working => working(frame, body, app),
         Step::Finished => finished(frame, body, app),
@@ -61,6 +78,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let hint = match app.step {
         Step::Welcome => "↑↓ choose · Enter select · q quit",
         Step::ChooseBackend => "↑↓ choose · Enter select · Esc back",
+        Step::AgeMethod => "↑↓ choose · Enter select · Esc back",
+        Step::Recipient => "paste a key or path · Enter continue · Esc back",
+        Step::Identity => "type a path · Enter continue · Esc back",
         Step::Compression => {
             if app.backend == Backend::Age {
                 "↑↓ choose · Enter select · Esc back"
@@ -68,12 +88,25 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 "type 0–9 · Enter continue · Esc back"
             }
         }
-        Step::Browse => "type to filter · paste a path · ↑↓ move · Enter open · ← up · Esc back",
+        Step::Browse => {
+            "type to filter · paste a path · Tab hidden · ↑↓ move · Enter open · ← up · Esc back"
+        }
         Step::Passphrase => match app.flow {
-            Flow::Encrypt => "type password · Tab switch field · Enter continue · Esc back",
-            Flow::Decrypt => "type password · Enter continue · Esc back",
+            Flow::Encrypt => {
+                "type password · Tab switch field · Ctrl-R show · Enter continue · Esc back"
+            }
+            Flow::Decrypt if app.backend == Backend::Age => {
+                "type password · Ctrl-R show · Ctrl-K key file · Enter continue · Esc back"
+            }
+            Flow::Decrypt => "type password · Ctrl-R show · Enter continue · Esc back",
         },
-        Step::Review => "Enter confirm · Esc back",
+        Step::Review => {
+            if app.editing_output {
+                "type a path · Enter save · Esc cancel"
+            } else {
+                "Enter confirm · e change destination · Esc back"
+            }
+        }
         Step::Working => "please wait…",
         Step::Finished => "Enter do another · q quit",
     };
@@ -94,7 +127,7 @@ fn body_block(title: &str) -> Block<'_> {
 }
 
 fn welcome(frame: &mut Frame, area: Rect, app: &App) {
-    let options = ["Create", "Extract", "Quit"];
+    let options = ["Lock or compress a file", "Open a locked file", "Quit"];
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -175,11 +208,75 @@ fn choose_backend(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+fn age_method(frame: &mut Frame, area: Rect, app: &App) {
+    let options = [
+        "Lock with a password",
+        "Lock for a person (their age public key)",
+    ];
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  How should age lock it?",
+            Style::new().fg(Color::Gray),
+        )),
+        Line::from(""),
+    ];
+    lines.extend(menu_lines(&options, app.menu));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  A password is shared by both people. A recipient key locks the file for",
+        Style::new().fg(DIM),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  one person — only their key opens it, with no shared password.",
+        Style::new().fg(DIM),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(body_block("age"))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+/// A single-line text entry screen (used for the recipient key and the identity
+/// file path). `prompt` is the bold heading; `hint` the dim explainer below.
+fn text_entry(frame: &mut Frame, area: Rect, app: &App, title: &str, prompt: &str, hint: &str) {
+    let mut lines = vec![
+        Line::from(""),
+        heading(prompt.to_string()),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ", Style::new().fg(DIM)),
+            Span::styled(
+                app.text_input.clone(),
+                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("▏", Style::new().fg(ACCENT)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(format!("  {hint}"), Style::new().fg(DIM))),
+    ];
+    if let Some(note) = &app.note {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {note}"),
+            Style::new().fg(ERR),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(body_block(title))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
 fn compression(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "  How small should it be?",
+            "  How hard should we try to shrink it?",
             Style::new().fg(Color::Gray),
         )),
         Line::from(""),
@@ -209,6 +306,11 @@ fn compression(frame: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(DIM),
         )));
     }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Already-compressed files (photos, video) won't get much smaller.",
+        Style::new().fg(DIM),
+    )));
     frame.render_widget(
         Paragraph::new(lines)
             .block(body_block("Compression"))
@@ -298,12 +400,12 @@ fn passphrase(frame: &mut Frame, area: Rect, app: &App) {
             lines.push(Line::from(""));
             lines.push(field_line(
                 "Password",
-                &mask(&app.password),
+                &field_value(app, &app.password),
                 app.field == Field::Password,
             ));
             lines.push(field_line(
                 "Repeat ",
-                &mask(&app.confirm),
+                &field_value(app, &app.confirm),
                 app.field == Field::Confirm,
             ));
             lines.push(Line::from(""));
@@ -315,7 +417,11 @@ fn passphrase(frame: &mut Frame, area: Rect, app: &App) {
         Flow::Decrypt => {
             lines.push(heading(format!("Enter the password for \"{name}\"")));
             lines.push(Line::from(""));
-            lines.push(field_line("Password", &mask(&app.password), true));
+            lines.push(field_line(
+                "Password",
+                &field_value(app, &app.password),
+                true,
+            ));
         }
     }
     if let Some(note) = &app.note {
@@ -347,10 +453,25 @@ fn review(frame: &mut Frame, area: Rect, app: &App) {
             }));
             lines.push(Line::from(""));
             lines.push(kv("From ", &source));
-            lines.push(kv("To   ", &output));
+            if app.editing_output {
+                lines.push(edit_line("To   ", &app.output_input));
+            } else {
+                lines.push(kv("To   ", &output));
+            }
             lines.push(kv("Using", app.backend.title()));
-            lines.push(kv("Squeeze", &compression_label(app.level)));
+            if app.backend == Backend::Age && app.age_method == AgeMethod::Recipients {
+                let n = app.recipients.len();
+                let who = if n == 1 { "recipient" } else { "recipients" };
+                lines.push(kv("For", &format!("{n} {who} (their age key)")));
+            }
+            lines.push(kv("Compression", &compression_label(app.level)));
             lines.push(Line::from(""));
+            if app.will_overwrite {
+                lines.push(Line::from(Span::styled(
+                    format!("  This replaces the existing {}.", name_of(&app.output)),
+                    Style::new().fg(WARN),
+                )));
+            }
             if is_zip {
                 lines.push(Line::from(Span::styled(
                     "  No password — anyone can open this file.",
@@ -370,7 +491,14 @@ fn review(frame: &mut Frame, area: Rect, app: &App) {
             lines.push(heading("Ready to extract".into()));
             lines.push(Line::from(""));
             lines.push(kv("File", &source));
-            lines.push(kv("Into", &output));
+            if app.editing_output {
+                lines.push(edit_line("Into", &app.output_input));
+            } else {
+                lines.push(kv("Into", &output));
+            }
+            if let Some(id) = &app.identity {
+                lines.push(kv("Key", &id.to_string_lossy()));
+            }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "  Press Enter to extract.",
@@ -402,6 +530,11 @@ fn working(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(""),
         Line::from(Span::styled(
             "   This can take a moment for large folders.",
+            Style::new().fg(DIM),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("   Elapsed: {}s", app.elapsed_secs()),
             Style::new().fg(DIM),
         )),
     ];
@@ -497,8 +630,38 @@ fn kv(key: &str, value: &str) -> Line<'static> {
     ])
 }
 
+/// Like `kv`, but for the editable destination field: the value is accented and
+/// followed by a cursor bar.
+fn edit_line(key: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {key}   "), Style::new().fg(DIM)),
+        Span::styled(
+            value.to_string(),
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("▏", Style::new().fg(ACCENT)),
+    ])
+}
+
 fn mask(s: &str) -> String {
     "•".repeat(s.chars().count())
+}
+
+/// The password as shown on screen: clear text when revealed, else bullets.
+fn field_value(app: &App, s: &str) -> String {
+    if app.reveal {
+        s.to_string()
+    } else {
+        mask(s)
+    }
+}
+
+/// The file name of an optional path, for plain-language messages.
+fn name_of(p: &Option<std::path::PathBuf>) -> String {
+    p.as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// A plain-language name for a compression level, with the raw number.
@@ -547,4 +710,54 @@ fn note_overlay(frame: &mut Frame, area: Rect, note: &str) {
         .wrap(Wrap { trim: true }),
         line,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn draw(step: Step, prep: impl FnOnce(&mut App)) {
+        let mut app = App::new();
+        app.step = step;
+        prep(&mut app);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn every_screen_renders_without_panicking() {
+        let steps = [
+            Step::Welcome,
+            Step::ChooseBackend,
+            Step::AgeMethod,
+            Step::Compression,
+            Step::Browse,
+            Step::Recipient,
+            Step::Passphrase,
+            Step::Identity,
+            Step::Review,
+            Step::Working,
+            Step::Finished,
+        ];
+        for step in steps {
+            draw(step, |_| {});
+        }
+    }
+
+    #[test]
+    fn review_renders_recipient_and_overwrite_details() {
+        draw(Step::Review, |app| {
+            app.flow = Flow::Encrypt;
+            app.backend = Backend::Age;
+            app.age_method = AgeMethod::Recipients;
+            app.recipients = vec!["age1example".into()];
+            app.will_overwrite = true;
+            app.output = Some(std::path::PathBuf::from("/tmp/thing.age"));
+        });
+        draw(Step::Finished, |app| {
+            app.outcome = Some(Err("wrong password, or the file is damaged".into()));
+        });
+    }
 }

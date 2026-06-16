@@ -40,6 +40,9 @@ pub struct Browser {
     /// (used when picking an archive to open). `None` lists everything and
     /// offers "lock this whole folder".
     only: Option<&'static [&'static str]>,
+    /// Whether dotfiles/dot-folders are shown (off by default for approachability;
+    /// toggled so hidden files are still reachable without the paste-a-path trick).
+    show_hidden: bool,
 }
 
 impl Browser {
@@ -53,9 +56,21 @@ impl Browser {
             state: ListState::default(),
             query: String::new(),
             only,
+            show_hidden: false,
         };
         b.reload();
         b
+    }
+
+    /// Show or hide dotfiles/dot-folders, then refresh the listing.
+    pub fn toggle_hidden(&mut self) {
+        self.show_hidden = !self.show_hidden;
+        self.reload();
+    }
+
+    /// Whether hidden entries are currently shown (for the footer hint).
+    pub fn show_hidden(&self) -> bool {
+        self.show_hidden
     }
 
     pub fn cwd(&self) -> &Path {
@@ -154,8 +169,8 @@ impl Browser {
             for entry in read.flatten() {
                 let path = entry.path();
                 let name = file_name(&path);
-                if name.starts_with('.') {
-                    continue; // hide dotfiles to keep the list approachable
+                if !self.show_hidden && name.starts_with('.') {
+                    continue; // hide dotfiles by default to keep the list approachable
                 }
                 let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
                 if is_dir {
@@ -252,22 +267,9 @@ impl Browser {
         }
     }
 
-    /// Resolve a typed path: expand a leading `~`, and treat relative paths as
-    /// relative to the current directory.
+    /// Resolve a typed path relative to the current directory (see `expand_path`).
     fn expand(&self, raw: &str) -> PathBuf {
-        let trimmed = raw.trim();
-        if let Some(rest) = trimmed.strip_prefix('~') {
-            if let Some(home) = std::env::var_os("HOME") {
-                let rest = rest.strip_prefix('/').unwrap_or(rest);
-                return PathBuf::from(home).join(rest);
-            }
-        }
-        let p = PathBuf::from(trimmed);
-        if p.is_absolute() {
-            p
-        } else {
-            self.cwd.join(p)
-        }
+        expand_path(raw, &self.cwd)
     }
 
     fn file_allowed(&self, path: &Path) -> bool {
@@ -279,6 +281,25 @@ impl Browser {
                 .map(|e| exts.contains(&e.as_str()))
                 .unwrap_or(false),
         }
+    }
+}
+
+/// Resolve a typed path: expand a leading `~` to `$HOME`, and treat a relative
+/// path as relative to `base`. Used by the browser's paste-a-path and by the
+/// Review screen's destination editor.
+pub fn expand_path(raw: &str, base: &Path) -> PathBuf {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix('~') {
+        if let Some(home) = std::env::var_os("HOME") {
+            let rest = rest.strip_prefix('/').unwrap_or(rest);
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    let p = PathBuf::from(trimmed);
+    if p.is_absolute() {
+        p
+    } else {
+        base.join(p)
     }
 }
 
@@ -502,6 +523,19 @@ mod tests {
             b.push_query(c);
         }
         assert!(matches!(b.resolve_query(), Action::None));
+    }
+
+    #[test]
+    fn toggle_hidden_reveals_and_hides_dotfiles() {
+        let dir = fixture();
+        let mut b = Browser::new(dir.path().to_path_buf(), None);
+        assert!(!labels(&b).iter().any(|l| l.contains(".hidden")));
+        b.toggle_hidden();
+        assert!(b.show_hidden());
+        assert!(labels(&b).iter().any(|l| l.contains(".hidden")));
+        b.toggle_hidden();
+        assert!(!b.show_hidden());
+        assert!(!labels(&b).iter().any(|l| l.contains(".hidden")));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! The wizard: a small state machine over a handful of screens, plus a worker
 //! thread so encryption never freezes the interface.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::backend::{self, Backend};
 use crate::browser::{Action, Browser};
@@ -24,13 +25,26 @@ pub enum Flow {
 pub enum Step {
     Welcome,
     ChooseBackend,
+    /// age only: lock with a password, or for a recipient (their public key).
+    AgeMethod,
     /// Pick the compression level for the chosen method.
     Compression,
     Browse,
+    /// age recipient mode: type/paste the recipient's public key or a key file.
+    Recipient,
     Passphrase,
+    /// age decrypt: type/paste the path to your identity (key) file.
+    Identity,
     Review,
     Working,
     Finished,
+}
+
+/// How an age archive will be locked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AgeMethod {
+    Password,
+    Recipients,
 }
 
 /// Which passphrase field is focused while encrypting.
@@ -57,9 +71,27 @@ pub struct App {
     pub field: Field,
     pub source: Option<PathBuf>,
     pub output: Option<PathBuf>,
+    /// age lock method (password vs recipients), chosen on the AgeMethod step.
+    pub age_method: AgeMethod,
+    /// Recipients (age public keys) collected for a recipient-mode encrypt.
+    pub recipients: Vec<String>,
+    /// An age identity (key) file chosen to open a recipient-encrypted archive.
+    pub identity: Option<PathBuf>,
+    /// Shared text buffer for the Recipient and Identity entry screens.
+    pub text_input: String,
     /// A transient, plain-language note shown in red (e.g. passwords differ).
     pub note: Option<String>,
+    /// True when confirming on Review would overwrite an existing output file.
+    pub will_overwrite: bool,
+    /// True while the user is editing the destination path on the Review screen.
+    pub editing_output: bool,
+    /// The destination path being typed in the Review editor.
+    pub output_input: String,
+    /// Show the typed password in clear text (toggled on the passphrase screen).
+    pub reveal: bool,
     pub tick: u64,
+    /// The `tick` when the current job started, for the elapsed-time display.
+    job_start: u64,
     pub outcome: Option<std::result::Result<PathBuf, String>>,
     job: Option<Receiver<std::result::Result<PathBuf, String>>>,
     quit: bool,
@@ -80,12 +112,43 @@ impl App {
             field: Field::Password,
             source: None,
             output: None,
+            age_method: AgeMethod::Password,
+            recipients: Vec::new(),
+            identity: None,
+            text_input: String::new(),
             note: None,
+            will_overwrite: false,
+            editing_output: false,
+            output_input: String::new(),
+            reveal: false,
             tick: 0,
+            job_start: 0,
             outcome: None,
             job: None,
             quit: false,
         }
+    }
+
+    /// Seconds elapsed since the current job started (for the Working screen).
+    pub fn elapsed_secs(&self) -> u64 {
+        self.tick.saturating_sub(self.job_start) / 10
+    }
+
+    /// Move to the Review screen, flagging whether confirming would overwrite an
+    /// existing output. Only the encrypt flow can overwrite — decrypt relocates
+    /// under a non-colliding name and never clobbers.
+    fn enter_review(&mut self) {
+        self.reveal = false;
+        self.editing_output = false;
+        self.recompute_overwrite();
+        self.step = Step::Review;
+    }
+
+    /// Flag whether the chosen output already exists (encrypt only — decrypt
+    /// relocates under a non-colliding name and never clobbers).
+    fn recompute_overwrite(&mut self) {
+        self.will_overwrite =
+            self.flow == Flow::Encrypt && self.output.as_ref().is_some_and(|p| p.exists());
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -114,9 +177,12 @@ impl App {
         match self.step {
             Step::Welcome => self.on_welcome(key.code),
             Step::ChooseBackend => self.on_choose_backend(key.code),
+            Step::AgeMethod => self.on_age_method(key.code),
             Step::Compression => self.on_compression(key.code),
-            Step::Browse => self.on_browse(key.code),
+            Step::Browse => self.on_browse(key),
+            Step::Recipient => self.on_recipient(key.code),
             Step::Passphrase => self.on_passphrase(key),
+            Step::Identity => self.on_identity(key.code),
             Step::Review => self.on_review(key.code),
             Step::Working => {}
             Step::Finished => self.on_finished(key.code),
@@ -129,15 +195,19 @@ impl App {
         match code {
             KeyCode::Up => self.menu = self.menu.saturating_sub(1),
             KeyCode::Down => self.menu = (self.menu + 1).min(2),
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            // Esc is "go back" everywhere else, so on Welcome it does nothing
+            // rather than surprising the user by quitting; 'q' is the exit.
+            KeyCode::Char('q') => self.quit = true,
             KeyCode::Enter => match self.menu {
                 0 => {
                     self.flow = Flow::Encrypt;
                     self.menu = 0;
+                    self.reset_lock_state();
                     self.step = Step::ChooseBackend;
                 }
                 1 => {
                     self.flow = Flow::Decrypt;
+                    self.reset_lock_state();
                     self.browser = Browser::new(home_dir(), Some(ARCHIVE_EXTS));
                     self.step = Step::Browse;
                 }
@@ -167,6 +237,30 @@ impl App {
                     return;
                 }
                 self.backend = backend;
+                // age can also lock for a recipient; other backends go straight
+                // to the compression step.
+                if backend == Backend::Age {
+                    self.menu = 0;
+                    self.step = Step::AgeMethod;
+                } else {
+                    self.enter_compression();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_age_method(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Up => self.menu = self.menu.saturating_sub(1),
+            KeyCode::Down => self.menu = (self.menu + 1).min(1),
+            KeyCode::Esc => self.step = Step::ChooseBackend,
+            KeyCode::Enter => {
+                self.age_method = if self.menu == 0 {
+                    AgeMethod::Password
+                } else {
+                    AgeMethod::Recipients
+                };
                 self.enter_compression();
             }
             _ => {}
@@ -186,7 +280,7 @@ impl App {
             match code {
                 KeyCode::Up => self.menu = self.menu.saturating_sub(1),
                 KeyCode::Down => self.menu = (self.menu + 1).min(2),
-                KeyCode::Esc => self.step = Step::ChooseBackend,
+                KeyCode::Esc => self.step = Step::AgeMethod,
                 KeyCode::Enter => self.confirm_compression(),
                 _ => {}
             }
@@ -213,8 +307,13 @@ impl App {
         self.step = Step::Browse;
     }
 
-    fn on_browse(&mut self, code: KeyCode) {
-        match code {
+    fn on_browse(&mut self, key: KeyEvent) {
+        // Tab toggles hidden (dot) files; the footer advertises it.
+        if key.code == KeyCode::Tab {
+            self.browser.toggle_hidden();
+            return;
+        }
+        match key.code {
             KeyCode::Up => self.browser.move_up(),
             KeyCode::Down => self.browser.move_down(),
             KeyCode::Left => self.browser.go_up(),
@@ -255,12 +354,23 @@ impl App {
     }
 
     fn choose_path(&mut self, path: PathBuf) {
-        let needs_password = match self.flow {
+        self.password.zeroize();
+        self.confirm.zeroize();
+        self.field = Field::Password;
+
+        match self.flow {
             Flow::Encrypt => {
                 self.output = Some(backend::suggested_output(&path, self.backend));
                 self.source = Some(path);
-                // zip is compress-only; age and 7z always need a password.
-                self.backend != Backend::Zip
+                if self.backend == Backend::Age && self.age_method == AgeMethod::Recipients {
+                    // No passphrase — collect the recipient's public key next.
+                    self.text_input.clear();
+                    self.step = Step::Recipient;
+                } else if self.backend == Backend::Zip {
+                    self.enter_review(); // compress-only, no password
+                } else {
+                    self.step = Step::Passphrase;
+                }
             }
             Flow::Decrypt => {
                 match backend::backend_for(&path) {
@@ -284,24 +394,36 @@ impl App {
                 // A plain (unencrypted) zip opens without asking for a password.
                 let encrypted = backend::is_encrypted(&path).unwrap_or(true);
                 self.source = Some(path);
-                encrypted
+                if encrypted {
+                    self.step = Step::Passphrase;
+                } else {
+                    self.enter_review();
+                }
             }
-        };
-        self.password.clear();
-        self.confirm.clear();
-        self.field = Field::Password;
-        self.step = if needs_password {
-            Step::Passphrase
-        } else {
-            Step::Review
-        };
+        }
     }
 
     fn on_passphrase(&mut self, key: KeyEvent) {
+        // Ctrl-R reveals/hides the typed password so a user can check it.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+            self.reveal = !self.reveal;
+            return;
+        }
+        // Ctrl-K: open a recipient-encrypted age archive with a key file instead.
+        if self.flow == Flow::Decrypt
+            && self.backend == Backend::Age
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('k')
+        {
+            self.text_input.clear();
+            self.step = Step::Identity;
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
-                self.password.clear();
-                self.confirm.clear();
+                self.password.zeroize();
+                self.confirm.zeroize();
+                self.reveal = false;
                 self.step = Step::Browse;
             }
             KeyCode::Char(c) => self.current_field().push(c),
@@ -326,6 +448,97 @@ impl App {
         }
     }
 
+    // -- age recipient / identity entry -----------------------------------
+
+    fn on_recipient(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.text_input.clear();
+                self.step = Step::Browse;
+            }
+            KeyCode::Char(c) => self.text_input.push(c),
+            KeyCode::Backspace => {
+                self.text_input.pop();
+            }
+            KeyCode::Enter => self.submit_recipient(),
+            _ => {}
+        }
+    }
+
+    fn submit_recipient(&mut self) {
+        let raw = self.text_input.trim().to_string();
+        if raw.is_empty() {
+            self.note = Some("Paste the recipient's public key, or a key file path.".into());
+            return;
+        }
+        // A path to a key file lists its recipients; otherwise it's a literal key.
+        let path = crate::browser::expand_path(&raw, &home_dir());
+        let recipients = if path.is_file() {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    let v: Vec<String> = text
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                        .map(str::to_string)
+                        .collect();
+                    if v.is_empty() {
+                        self.note = Some("That key file has no recipients in it.".into());
+                        return;
+                    }
+                    v
+                }
+                Err(_) => {
+                    self.note = Some("Could not read that key file.".into());
+                    return;
+                }
+            }
+        } else {
+            vec![raw]
+        };
+        self.recipients = recipients;
+        self.enter_review();
+    }
+
+    fn on_identity(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.text_input.clear();
+                self.step = Step::Passphrase;
+            }
+            KeyCode::Char(c) => self.text_input.push(c),
+            KeyCode::Backspace => {
+                self.text_input.pop();
+            }
+            KeyCode::Enter => self.submit_identity(),
+            _ => {}
+        }
+    }
+
+    fn submit_identity(&mut self) {
+        let raw = self.text_input.trim();
+        if raw.is_empty() {
+            self.note = Some("Enter the path to your age key file.".into());
+            return;
+        }
+        let path = crate::browser::expand_path(raw, &home_dir());
+        if !path.is_file() {
+            self.note = Some("No key file at that path.".into());
+            return;
+        }
+        self.identity = Some(path);
+        self.enter_review();
+    }
+
+    /// Forget any age recipients/identity and reset to password mode (called
+    /// when starting a fresh encrypt or decrypt).
+    fn reset_lock_state(&mut self) {
+        self.age_method = AgeMethod::Password;
+        self.recipients.clear();
+        self.identity = None;
+        self.text_input.clear();
+    }
+
     fn submit_passphrase(&mut self) {
         if self.password.is_empty() {
             self.note = Some("Please type a password.".into());
@@ -339,20 +552,82 @@ impl App {
             }
             if self.password != self.confirm {
                 self.note = Some("The two passwords don't match. Try again.".into());
-                self.confirm.clear();
+                self.confirm.zeroize();
                 self.field = Field::Confirm;
                 return;
             }
         }
-        self.step = Step::Review;
+        self.enter_review();
     }
 
     fn on_review(&mut self, code: KeyCode) {
+        if self.editing_output {
+            match code {
+                KeyCode::Esc => self.editing_output = false,
+                KeyCode::Enter => self.commit_output_edit(),
+                KeyCode::Char(c) => self.output_input.push(c),
+                KeyCode::Backspace => {
+                    self.output_input.pop();
+                }
+                _ => {}
+            }
+            return;
+        }
         match code {
-            KeyCode::Esc => self.step = Step::Passphrase,
+            KeyCode::Char('e') => self.begin_output_edit(),
+            KeyCode::Esc => self.review_back(),
             KeyCode::Enter => self.start_job(),
             _ => {}
         }
+    }
+
+    /// Step back from Review to whichever screen led here.
+    fn review_back(&mut self) {
+        self.step = match self.flow {
+            Flow::Encrypt => {
+                if self.backend == Backend::Age && self.age_method == AgeMethod::Recipients {
+                    Step::Recipient
+                } else if self.backend == Backend::Zip {
+                    Step::Browse
+                } else {
+                    Step::Passphrase
+                }
+            }
+            Flow::Decrypt if self.identity.is_some() => Step::Identity,
+            Flow::Decrypt => Step::Passphrase,
+        };
+    }
+
+    /// Start editing the destination on Review, seeded with the current path.
+    fn begin_output_edit(&mut self) {
+        self.output_input = self
+            .output
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.editing_output = true;
+    }
+
+    /// Apply the typed destination. A relative path resolves against the folder
+    /// the file/extraction was already headed for (encrypt: the output's parent;
+    /// decrypt: the destination folder itself); `~` and absolute paths override.
+    fn commit_output_edit(&mut self) {
+        self.editing_output = false;
+        let raw = self.output_input.trim();
+        if raw.is_empty() {
+            return;
+        }
+        let base = match self.flow {
+            Flow::Encrypt => self
+                .output
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(Path::to_path_buf),
+            Flow::Decrypt => self.output.clone(),
+        }
+        .unwrap_or_else(home_dir);
+        self.output = Some(crate::browser::expand_path(raw, &base));
+        self.recompute_overwrite();
     }
 
     fn on_finished(&mut self, code: KeyCode) {
@@ -363,6 +638,7 @@ impl App {
                 self.source = None;
                 self.output = None;
                 self.menu = 0;
+                self.reset_lock_state();
                 self.step = Step::Welcome;
             }
             _ => {}
@@ -378,20 +654,35 @@ impl App {
         let backend = self.backend;
         let flow = self.flow;
         let level = self.level;
-        let password = std::mem::take(&mut self.password);
-        self.confirm.clear();
+        let age_method = self.age_method;
+        let recipients = self.recipients.clone();
+        let identity = self.identity.clone();
+        // Hand the worker a copy that wipes itself on drop. (String zeroization
+        // is best-effort: chars typed earlier may have left reallocated copies.)
+        let password = Zeroizing::new(std::mem::take(&mut self.password));
+        self.confirm.zeroize();
 
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let result = match flow {
-                Flow::Encrypt => backend::encrypt(backend, &source, &output, &password, level)
-                    .map(|()| output.clone()),
-                Flow::Decrypt => backend::decrypt(&source, &output, &password),
+                Flow::Encrypt => {
+                    let r = if backend == Backend::Age && age_method == AgeMethod::Recipients {
+                        backend::encrypt_for_recipients(&source, &output, &recipients, level)
+                    } else {
+                        backend::encrypt(backend, &source, &output, &password, level)
+                    };
+                    r.map(|()| output.clone())
+                }
+                Flow::Decrypt => match &identity {
+                    Some(id) => backend::decrypt_with_identity(&source, &output, id),
+                    None => backend::decrypt(&source, &output, &password),
+                },
             };
             let _ = tx.send(result.map_err(|e| e.to_string()));
         });
 
         self.job = Some(rx);
+        self.job_start = self.tick;
         self.step = Step::Working;
     }
 
@@ -491,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn choosing_any_backend_goes_to_compression() {
+    fn choosing_a_backend_advances_the_wizard() {
         for (downs, backend) in [
             (0usize, Backend::Age),
             (1, Backend::SevenZip),
@@ -507,10 +798,18 @@ mod tests {
                 app.on_key(press(KeyCode::Down));
             }
             app.on_key(press(KeyCode::Enter));
-            assert!(
-                matches!(app.step, Step::Compression),
-                "{backend:?} should lead to the compression step"
-            );
+            if backend == Backend::Age {
+                // age first asks how to lock (password vs recipient).
+                assert!(
+                    matches!(app.step, Step::AgeMethod),
+                    "age should lead to the method step"
+                );
+            } else {
+                assert!(
+                    matches!(app.step, Step::Compression),
+                    "{backend:?} should lead to the compression step"
+                );
+            }
         }
     }
 
@@ -732,6 +1031,76 @@ mod tests {
     }
 
     #[test]
+    fn age_recipient_wizard_routes_through_recipient_step() {
+        if Backend::Age.locate().is_none() {
+            eprintln!("skipping: age backend not installed");
+            return;
+        }
+        let mut app = App::new();
+        app.flow = Flow::Encrypt;
+        app.step = Step::ChooseBackend; // age is menu 0
+        app.on_key(press(KeyCode::Enter)); // choose age -> AgeMethod
+        assert!(matches!(app.step, Step::AgeMethod));
+
+        app.on_key(press(KeyCode::Down)); // highlight "for a recipient"
+        app.on_key(press(KeyCode::Enter)); // -> Compression
+        assert!(matches!(app.step, Step::Compression));
+        assert_eq!(app.age_method, AgeMethod::Recipients);
+
+        app.on_key(press(KeyCode::Enter)); // accept compression -> Browse
+        assert!(matches!(app.step, Step::Browse));
+
+        app.choose_path(PathBuf::from("/tmp/docs")); // -> Recipient (no password)
+        assert!(matches!(app.step, Step::Recipient));
+
+        typed(&mut app, "age1qqqexamplekey");
+        app.on_key(press(KeyCode::Enter)); // -> Review
+        assert!(matches!(app.step, Step::Review));
+        assert_eq!(app.recipients, vec!["age1qqqexamplekey".to_string()]);
+        // Esc from Review goes back to the recipient step, not the password one.
+        app.on_key(press(KeyCode::Esc));
+        assert!(matches!(app.step, Step::Recipient));
+    }
+
+    #[test]
+    fn decrypt_age_ctrl_k_opens_identity_entry_and_validates() {
+        let mut app = App::new();
+        app.flow = Flow::Decrypt;
+        app.backend = Backend::Age;
+        app.step = Step::Passphrase;
+        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert!(matches!(app.step, Step::Identity));
+
+        typed(&mut app, "/no/such/key");
+        app.on_key(press(KeyCode::Enter));
+        assert!(
+            matches!(app.step, Step::Identity),
+            "a missing key file keeps us on the entry screen"
+        );
+        assert!(app.note.is_some());
+        assert!(app.identity.is_none());
+    }
+
+    #[test]
+    fn decrypt_age_identity_accepts_an_existing_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("id.txt");
+        fs::write(&key, b"AGE-SECRET-KEY-EXAMPLE").unwrap();
+
+        let mut app = App::new();
+        app.flow = Flow::Decrypt;
+        app.backend = Backend::Age;
+        app.source = Some(dir.path().join("x.age"));
+        app.output = Some(dir.path().to_path_buf());
+        app.step = Step::Identity;
+        typed(&mut app, key.to_str().unwrap());
+        app.on_key(press(KeyCode::Enter));
+
+        assert!(matches!(app.step, Step::Review));
+        assert_eq!(app.identity.as_deref(), Some(key.as_path()));
+    }
+
+    #[test]
     fn finished_enter_returns_to_welcome() {
         let mut app = App::new();
         app.step = Step::Finished;
@@ -739,5 +1108,117 @@ mod tests {
         app.on_key(press(KeyCode::Enter));
         assert!(matches!(app.step, Step::Welcome));
         assert!(app.outcome.is_none());
+    }
+
+    #[test]
+    fn esc_on_welcome_does_not_quit() {
+        let mut app = App::new();
+        app.on_key(press(KeyCode::Esc));
+        assert!(!app.quit, "Esc on Welcome should be a no-op, not an exit");
+        assert!(matches!(app.step, Step::Welcome));
+    }
+
+    #[test]
+    fn ctrl_r_toggles_password_reveal() {
+        let mut app = App::new();
+        app.step = Step::Passphrase;
+        assert!(!app.reveal);
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(app.reveal, "Ctrl-R should reveal");
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(!app.reveal, "Ctrl-R again should hide");
+        // A plain 'r' is still a password character, not a toggle.
+        app.on_key(press(KeyCode::Char('r')));
+        assert_eq!(app.password, "r");
+        assert!(!app.reveal);
+    }
+
+    #[test]
+    fn review_flags_an_existing_output_for_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("thing.age");
+        fs::write(&out, b"old").unwrap();
+
+        let mut app = App::new();
+        app.flow = Flow::Encrypt;
+        app.source = Some(dir.path().join("thing"));
+        app.output = Some(out);
+        app.step = Step::Passphrase;
+        typed(&mut app, "hunter2");
+        app.on_key(press(KeyCode::Tab));
+        typed(&mut app, "hunter2");
+        app.on_key(press(KeyCode::Enter));
+
+        assert!(matches!(app.step, Step::Review));
+        assert!(app.will_overwrite, "an existing output must be flagged");
+    }
+
+    #[test]
+    fn editing_the_destination_retargets_output_and_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.age");
+        fs::write(&existing, b"x").unwrap();
+
+        let mut app = App::new();
+        app.flow = Flow::Encrypt;
+        app.source = Some(dir.path().join("thing"));
+        app.output = Some(dir.path().join("thing.age")); // fresh, no overwrite
+        app.step = Step::Review;
+
+        app.on_key(press(KeyCode::Char('e'))); // begin edit
+        assert!(app.editing_output);
+        let seeded = app.output_input.len();
+        for _ in 0..seeded {
+            app.on_key(press(KeyCode::Backspace));
+        }
+        typed(&mut app, existing.to_str().unwrap());
+        app.on_key(press(KeyCode::Enter)); // commit
+
+        assert!(!app.editing_output);
+        assert_eq!(app.output.as_deref(), Some(existing.as_path()));
+        assert!(
+            app.will_overwrite,
+            "retargeting onto an existing file must flag the overwrite"
+        );
+    }
+
+    #[test]
+    fn editing_the_destination_accepts_a_bare_name_beside_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        app.flow = Flow::Encrypt;
+        app.source = Some(dir.path().join("thing"));
+        app.output = Some(dir.path().join("thing.age"));
+        app.step = Step::Review;
+
+        app.on_key(press(KeyCode::Char('e')));
+        let seeded = app.output_input.len();
+        for _ in 0..seeded {
+            app.on_key(press(KeyCode::Backspace));
+        }
+        typed(&mut app, "backup.age"); // bare name -> same folder as the original
+        app.on_key(press(KeyCode::Enter));
+
+        assert_eq!(
+            app.output.as_deref(),
+            Some(dir.path().join("backup.age").as_path())
+        );
+    }
+
+    #[test]
+    fn review_does_not_flag_a_fresh_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new();
+        app.flow = Flow::Encrypt;
+        app.source = Some(dir.path().join("thing"));
+        app.output = Some(dir.path().join("thing.age")); // does not exist
+        app.step = Step::Passphrase;
+        typed(&mut app, "pw");
+        app.on_key(press(KeyCode::Tab));
+        typed(&mut app, "pw");
+        app.on_key(press(KeyCode::Enter));
+
+        assert!(matches!(app.step, Step::Review));
+        assert!(!app.will_overwrite);
     }
 }

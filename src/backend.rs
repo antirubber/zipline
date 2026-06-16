@@ -113,15 +113,7 @@ pub fn encrypt(
         bail!("the password is empty");
     }
     let level = level.min(9);
-    // Both tools merge into an existing archive rather than replacing it, so
-    // start from a clean slate to keep re-encrypting the same target idempotent.
-    if output.exists() {
-        if output.is_dir() {
-            bail!("{} is a folder — choose a different name", output.display());
-        }
-        fs::remove_file(output)
-            .with_context(|| format!("could not replace {}", output.display()))?;
-    }
+    prepare_output(output)?;
 
     let (parent, name) = split(source)?;
 
@@ -131,6 +123,53 @@ pub fn encrypt(
         cleanup(output);
     }
     result
+}
+
+/// Encrypt `source` for one or more age recipients (their public keys), with no
+/// passphrase to share. age-only. Like the passphrase path, the contents are
+/// tarred (and optionally gzipped) first so file names stay confidential.
+pub fn encrypt_for_recipients(
+    source: &Path,
+    output: &Path,
+    recipients: &[String],
+    level: u8,
+) -> Result<()> {
+    let program = Backend::Age.program()?;
+    if !source.exists() {
+        bail!("{} does not exist", source.display());
+    }
+    if recipients.is_empty() {
+        bail!("no recipient given");
+    }
+    let level = level.min(9);
+    prepare_output(output)?;
+    let (parent, name) = split(source)?;
+    let result = age_encrypt(
+        &program,
+        &parent,
+        &name,
+        output,
+        AgeLock::Recipients(recipients),
+        level,
+    );
+    if result.is_err() {
+        cleanup(output);
+    }
+    result
+}
+
+/// Clear the way for a fresh `output`: both tools merge into an existing archive
+/// rather than replacing it, so start from a clean slate to keep re-encrypting
+/// the same target idempotent. Refuses to clobber a directory.
+fn prepare_output(output: &Path) -> Result<()> {
+    if output.exists() {
+        if output.is_dir() {
+            bail!("{} is a folder — choose a different name", output.display());
+        }
+        fs::remove_file(output)
+            .with_context(|| format!("could not replace {}", output.display()))?;
+    }
+    Ok(())
 }
 
 /// Drive the chosen backend to produce `output`. Split out from `encrypt` so the
@@ -145,7 +184,14 @@ fn pack(
     level: u8,
 ) -> Result<()> {
     match backend {
-        Backend::Age => age_encrypt(program, parent, name, output, passphrase, level),
+        Backend::Age => age_encrypt(
+            program,
+            parent,
+            name,
+            output,
+            AgeLock::Passphrase(passphrase),
+            level,
+        ),
         Backend::SevenZip => {
             let mut cmd = Command::new(program);
             cmd.current_dir(parent)
@@ -175,16 +221,23 @@ fn pack(
     }
 }
 
-/// Stream `name` through `tar` (optionally `gzip -level`) into `age -p`. A
-/// `level` of 0 skips compression entirely. age refuses a passphrase on stdin,
+/// How an age archive is locked while encrypting.
+enum AgeLock<'a> {
+    Passphrase(&'a str),
+    Recipients(&'a [String]),
+}
+
+/// Stream `name` through `tar` (optionally `gzip -level`) into `age`. A `level`
+/// of 0 skips compression entirely. With a passphrase, age refuses it on stdin,
 /// so it is driven through a pseudo-terminal while the archive arrives on its
-/// stdin pipe.
+/// stdin pipe; with recipients there is no secret to type, so age runs without a
+/// terminal.
 fn age_encrypt(
     program: &Path,
     parent: &Path,
     name: &OsStr,
     output: &Path,
-    passphrase: &str,
+    lock: AgeLock,
     level: u8,
 ) -> Result<()> {
     let mut tar = Command::new(tar_program()?)
@@ -221,8 +274,21 @@ fn age_encrypt(
     };
 
     let mut cmd = Command::new(program);
-    cmd.arg("-p").arg("-o").arg(output);
-    let enc = pty::run(cmd, Input::Pipe(stream), passphrase, "passphrase", 2);
+    cmd.arg("-o").arg(output);
+    let enc = match lock {
+        AgeLock::Passphrase(passphrase) => {
+            cmd.arg("-p");
+            pty::run(cmd, Input::Pipe(stream), passphrase, "passphrase", 2)
+        }
+        AgeLock::Recipients(recipients) => {
+            for r in recipients {
+                cmd.arg("-r").arg(r);
+            }
+            // No secret to type, so feed the archive on stdin and run to exit.
+            cmd.stdin(Stdio::from(stream));
+            run_age(cmd)
+        }
+    };
 
     let tar_status = tar.wait().context("tar did not finish")?;
     let gzip_ok = match gzip.as_mut() {
@@ -245,6 +311,35 @@ fn age_encrypt(
 /// keeps a hostile archive from overwriting the user's files and means a
 /// crafted member that escapes staging never lands in `dest`.
 pub fn decrypt(archive: &Path, dest: &Path, passphrase: &str) -> Result<PathBuf> {
+    decrypt_inner(archive, dest, AgeUnlock::Passphrase(passphrase))
+}
+
+/// Decrypt an age archive that was locked for a recipient, using the matching
+/// age identity (private key) file instead of a passphrase. age-only.
+pub fn decrypt_with_identity(archive: &Path, dest: &Path, identity: &Path) -> Result<PathBuf> {
+    if backend_for(archive)? != Backend::Age {
+        bail!("a key file only opens age (.age) archives");
+    }
+    decrypt_inner(archive, dest, AgeUnlock::Identity(identity))
+}
+
+/// How an age archive is unlocked while decrypting. The non-age backends only
+/// take a passphrase; an identity file is meaningful for age alone.
+enum AgeUnlock<'a> {
+    Passphrase(&'a str),
+    Identity(&'a Path),
+}
+
+impl AgeUnlock<'_> {
+    fn passphrase(&self) -> Option<&str> {
+        match self {
+            AgeUnlock::Passphrase(p) => Some(p),
+            AgeUnlock::Identity(_) => None,
+        }
+    }
+}
+
+fn decrypt_inner(archive: &Path, dest: &Path, unlock: AgeUnlock) -> Result<PathBuf> {
     let backend = backend_for(archive)?;
     let program = backend.program()?;
     if !archive.exists() {
@@ -257,17 +352,39 @@ pub fn decrypt(archive: &Path, dest: &Path, passphrase: &str) -> Result<PathBuf>
         .tempdir_in(dest)
         .context("could not create a temporary folder")?;
 
+    // A key file only opens age; 7z/zip need the passphrase.
+    let non_age_key_err = || anyhow!("a key file only opens age (.age) archives");
+
     match backend {
         Backend::Age => {
             let tar = tar_program()?;
             let tarball = staging.path().join("archive.tar.gz");
-            let mut cmd = Command::new(&program);
-            cmd.arg("-d").arg("-o").arg(&tarball).arg(archive);
-            pty::run(cmd, Input::Tty, passphrase, "passphrase", 1).map_err(wrong_password)?;
+            match unlock {
+                AgeUnlock::Passphrase(passphrase) => {
+                    let mut cmd = Command::new(&program);
+                    cmd.arg("-d").arg("-o").arg(&tarball).arg(archive);
+                    pty::run(cmd, Input::Tty, passphrase, "passphrase", 1)
+                        .map_err(wrong_password)?;
+                }
+                AgeUnlock::Identity(identity) => {
+                    // An identity file needs no terminal (assuming the key itself
+                    // is not passphrase-protected).
+                    let mut cmd = Command::new(&program);
+                    cmd.arg("-d")
+                        .arg("-i")
+                        .arg(identity)
+                        .arg("-o")
+                        .arg(&tarball)
+                        .arg(archive)
+                        .stdin(Stdio::null());
+                    run_age(cmd).map_err(wrong_password)?;
+                }
+            }
 
-            // Reject absolute or parent-escaping member names before extracting,
-            // so a hostile archive can't write outside the staging dir on any
-            // tar implementation (GNU tar also refuses these by default).
+            // Reject absolute or parent-escaping member *names* before
+            // extracting (the `../` traversal classic; GNU tar also refuses
+            // these by default). Symlink members with a safe name are caught
+            // after extraction by reject_escaping_symlinks.
             reject_unsafe_members(&tar, &tarball)?;
 
             let status = Command::new(&tar)
@@ -284,6 +401,7 @@ pub fn decrypt(archive: &Path, dest: &Path, passphrase: &str) -> Result<PathBuf>
             }
         }
         Backend::SevenZip => {
+            let passphrase = unlock.passphrase().ok_or_else(non_age_key_err)?;
             let mut cmd = Command::new(&program);
             // No `-p`: with an empty value 7z assumes an empty password and
             // fails before prompting. Omitting it lets 7z prompt instead.
@@ -295,8 +413,9 @@ pub fn decrypt(archive: &Path, dest: &Path, passphrase: &str) -> Result<PathBuf>
             pty::run(cmd, Input::Tty, passphrase, "password", 1).map_err(wrong_password)?;
         }
         Backend::Zip => {
-            // Vet member names before extracting, so a hostile zip can't escape
-            // the staging dir on a 7-Zip build that doesn't sanitise paths.
+            let passphrase = unlock.passphrase().ok_or_else(non_age_key_err)?;
+            // Vet member *names* before extracting (absolute / `..`). Symlink
+            // members are caught after extraction by reject_escaping_symlinks.
             reject_unsafe_zip_members(&program, archive)?;
 
             let mut cmd = Command::new(&program);
@@ -313,6 +432,13 @@ pub fn decrypt(archive: &Path, dest: &Path, passphrase: &str) -> Result<PathBuf>
             }
         }
     }
+
+    // Member *names* were vetted before extraction, but a member can also be a
+    // symlink with a safe name whose target points outside the folder. The
+    // system extractors refuse to write *through* such a link, but a surviving
+    // link would still be relocated into the user's folder — so reject any
+    // escaping symlink here, in-process, for every backend.
+    reject_escaping_symlinks(staging.path())?;
 
     relocate(staging.path(), dest)
 }
@@ -338,10 +464,9 @@ fn reject_unsafe_members(tar: &Path, tarball: &Path) -> Result<()> {
 }
 
 /// Bail if any member of `archive` (a zip) is an absolute path or escapes its
-/// folder with `..`. Like the age path's tar check, this does not trust the
-/// extraction tool: some `7za`/p7zip builds happily write such members outside
-/// the `-o` directory. A zip's member names are never encrypted, so the listing
-/// works without the password.
+/// folder with `..`. This is a name-only check on the `7z l -slt` listing;
+/// symlink members are vetted after extraction by reject_escaping_symlinks. A
+/// zip's member names are never encrypted, so the listing needs no password.
 fn reject_unsafe_zip_members(program: &Path, archive: &Path) -> Result<()> {
     let listing = Command::new(program)
         .arg("l")
@@ -392,6 +517,67 @@ fn is_unsafe_member(path: &str) -> bool {
         b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
     };
     norm.starts_with('/') || drive_absolute || norm.split('/').any(|c| c == "..")
+}
+
+/// Walk `staging` and refuse any symlink whose target escapes it. The pre-extract
+/// name checks reject `..`/absolute *names*; this catches the other half — a
+/// safe-named symlink pointing outside the folder — without trusting the
+/// extractor. Symlinks that stay inside `staging` (a folder's own internal
+/// links) are kept, so an honest archive of a folder with relative links still
+/// round-trips.
+fn reject_escaping_symlinks(staging: &Path) -> Result<()> {
+    let root = normalize(staging);
+    let mut stack = vec![staging.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).context("could not read the unpacked files")? {
+            let entry = entry?;
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path)
+                .with_context(|| format!("could not inspect {}", path.display()))?;
+            let ftype = meta.file_type();
+            if ftype.is_symlink() {
+                if symlink_escapes(&path, &root) {
+                    bail!("refusing to open this archive: it contains a link that points outside the folder");
+                }
+            } else if ftype.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether the symlink at `link` resolves to somewhere outside `root`. An
+/// absolute target always escapes; a relative one is resolved lexically against
+/// the link's own directory (the filesystem is not touched, since the target may
+/// not exist) and escapes if it climbs out of `root`. An unreadable link is
+/// refused.
+fn symlink_escapes(link: &Path, root: &Path) -> bool {
+    let target = match fs::read_link(link) {
+        Ok(t) => t,
+        Err(_) => return true,
+    };
+    if target.is_absolute() {
+        return true;
+    }
+    let resolved = normalize(&link.parent().unwrap_or(root).join(&target));
+    !resolved.starts_with(root)
+}
+
+/// Lexically resolve `.` and `..` in `path` without touching the filesystem.
+fn normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Move every top-level entry out of `staging` into `dest`, renaming to a free
@@ -476,21 +662,26 @@ fn split(source: &Path) -> Result<(PathBuf, OsString)> {
     Ok((parent, name))
 }
 
-/// Turn a backend's raw failure into a friendly message when it looks like a
-/// bad passphrase, otherwise pass it through.
+/// Turn a backend's raw failure into a friendly message. A clearly wrong key
+/// gets a crisp "wrong password"; an ambiguous decrypt/CRC failure — which for an
+/// encrypted archive can be either a wrong password or real corruption — keeps
+/// the hedged wording; anything else passes through unchanged.
 fn wrong_password(err: anyhow::Error) -> anyhow::Error {
     let text = err.to_string().to_ascii_lowercase();
-    if text.contains("wrong password")
+    let wrong_key = text.contains("wrong password")
         || text.contains("incorrect")
         || text.contains("bad passphrase")
         || text.contains("no identity matched")
-        || text.contains("failed to decrypt")
-        || text.contains("data error")
         || text.contains("can not open encrypted archive")
-        || text.contains("cannot open encrypted archive")
-        // 7-Zip's summary line when a zip member fails to decrypt.
-        || text.contains("sub items errors")
-    {
+        || text.contains("cannot open encrypted archive");
+    let damaged_or_wrong = text.contains("failed to decrypt")
+        || text.contains("data error")
+        || text.contains("crc failed")
+        // 7-Zip's summary line when a member fails to decrypt.
+        || text.contains("sub items errors");
+    if wrong_key {
+        anyhow!("wrong password")
+    } else if damaged_or_wrong {
         anyhow!("wrong password, or the file is damaged")
     } else {
         err
@@ -523,12 +714,62 @@ fn run_quietly(mut cmd: Command) -> Result<()> {
     bail!("{}", detail.trim())
 }
 
+/// Run an `age` invocation that needs no terminal — recipient encrypt (stdin is
+/// the archive stream) or identity decrypt — and surface age's own error on
+/// failure. The caller wires stdin/args; we capture and report stderr.
+fn run_age(mut cmd: Command) -> Result<()> {
+    let out = cmd.output().context("could not start age")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let detail = stderr
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("age reported an error")
+        .trim();
+    bail!("{}", detail.trim_start_matches("age: error: "))
+}
+
 fn tar_program() -> Result<PathBuf> {
     which("tar").ok_or_else(|| anyhow!("the 'tar' tool is not installed"))
 }
 
 fn gzip_program() -> Result<PathBuf> {
     which("gzip").ok_or_else(|| anyhow!("the 'gzip' tool is not installed"))
+}
+
+/// A plain-language report of which helper tools zipline can find, for the
+/// `zipline doctor` command. Each line is an "ok" with the resolved path, or a
+/// "missing" with how to install it. Pure read-only; only consults `PATH`.
+pub fn doctor() -> String {
+    fn report(found: Option<PathBuf>, name: &str, hint: &str) -> String {
+        match found {
+            Some(p) => format!("  ok       {name:<4} {}\n", p.display()),
+            None => format!("  missing  {name:<4} {hint}\n"),
+        }
+    }
+    let generic = "install it with your package manager (it usually ships with the system)";
+    let mut out = String::from("zipline helper tools:\n\n");
+    out.push_str(&report(
+        Backend::Age.locate(),
+        "age",
+        Backend::Age.install_hint(),
+    ));
+    out.push_str(&report(
+        Backend::SevenZip.locate(),
+        "7z",
+        Backend::SevenZip.install_hint(),
+    ));
+    out.push_str(&report(which("tar"), "tar", generic));
+    out.push_str(&report(which("gzip"), "gzip", generic));
+    out.push('\n');
+    out.push_str(
+        "age is needed for the secure backend; 7z for the portable/zip backends;\n\
+         tar and gzip for age archives. The wizard works with whatever is present.\n",
+    );
+    out
 }
 
 /// Find an executable named `name` on `PATH`.
@@ -787,5 +1028,73 @@ mod tests {
         assert_eq!(unique_path(dir.path(), name), dir.path().join("memo"));
         fs::create_dir(dir.path().join("memo")).unwrap();
         assert_eq!(unique_path(dir.path(), name), dir.path().join("memo (1)"));
+    }
+
+    #[test]
+    fn rejects_a_symlink_pointing_outside_staging() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        symlink("/etc/passwd", staging.join("esc")).unwrap();
+        let err = reject_escaping_symlinks(&staging).unwrap_err();
+        assert!(err.to_string().contains("outside the folder"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_a_relative_symlink_climbing_out() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        symlink("../../secret", staging.join("esc")).unwrap();
+        let err = reject_escaping_symlinks(&staging).unwrap_err();
+        assert!(err.to_string().contains("outside the folder"), "got: {err}");
+    }
+
+    #[test]
+    fn keeps_symlinks_that_stay_inside_staging() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        fs::create_dir_all(staging.join("sub")).unwrap();
+        fs::write(staging.join("real.txt"), b"hi").unwrap();
+        symlink("real.txt", staging.join("alias")).unwrap(); // -> staging/real.txt
+        symlink("../real.txt", staging.join("sub/back")).unwrap(); // -> staging/real.txt
+        assert!(reject_escaping_symlinks(&staging).is_ok());
+    }
+
+    #[test]
+    fn doctor_reports_every_helper_tool() {
+        let r = doctor();
+        for tool in ["age", "7z", "tar", "gzip"] {
+            assert!(r.contains(tool), "doctor report omits {tool}:\n{r}");
+        }
+        // Every tool line resolves to either an ok or a missing verdict.
+        assert!(
+            r.contains("ok") || r.contains("missing"),
+            "no verdicts:\n{r}"
+        );
+    }
+
+    #[test]
+    fn age_decrypt_rejects_an_escaping_symlink_member() {
+        use std::os::unix::fs::symlink;
+        if Backend::Age.locate().is_none() {
+            eprintln!("skipping: age backend not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("folder");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("ok.txt"), b"fine").unwrap();
+        symlink("/etc/passwd", src.join("esc")).unwrap();
+
+        let out = dir.path().join("folder.age");
+        encrypt(Backend::Age, &src, &out, "pw", 0).unwrap();
+
+        let dest = dir.path().join("dest");
+        let err = decrypt(&out, &dest, "pw").unwrap_err();
+        assert!(err.to_string().contains("outside the folder"), "got: {err}");
     }
 }

@@ -144,14 +144,12 @@ verify_checksum() {
   local sums expected actual
   sums="$(curl -fsSL "${url}.sha256" 2>/dev/null || true)"
   if [ -z "$sums" ]; then
-    warn "no published checksum for this release — skipping integrity check"
-    return 0
+    die "no published checksum for this release — refusing to install unverified"
   fi
   expected="$(printf '%s' "$sums" | awk '{print $1}')"
   actual="$(sha256_of "$file")"
   if [ -z "$actual" ]; then
-    warn "no sha256 tool found — skipping integrity check"
-    return 0
+    die "no sha256 tool found (install coreutils) — refusing to install unverified"
   fi
   [ "$expected" = "$actual" ] || die "checksum mismatch — refusing to install (expected $expected, got $actual)"
   ok "checksum verified"

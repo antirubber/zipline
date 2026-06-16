@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use nix::pty::openpty;
+use nix::sys::termios::{self, LocalFlags, SetArg};
+use zeroize::Zeroize;
 
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// After answering a prompt, how long to wait for another before assuming the
@@ -47,6 +49,15 @@ pub fn run(
     let pty = openpty(None, None).context("could not allocate a pseudo-terminal")?;
     let master: OwnedFd = pty.master;
     let slave: OwnedFd = pty.slave;
+
+    // Suppress terminal echo on the slave so a tool that prompts on the tty (7z)
+    // never reflects the passphrase back into the stream we read. age already
+    // runs no-echo itself; doing it here makes the guarantee hold for every
+    // backend and removes the echoed-marker rescan surface in answer_prompts.
+    if let Ok(mut tio) = termios::tcgetattr(&slave) {
+        tio.local_flags.remove(LocalFlags::ECHO);
+        let _ = termios::tcsetattr(&slave, SetArg::TCSANOW, &tio);
+    }
 
     match input {
         Input::Tty => {
@@ -105,15 +116,18 @@ pub fn run(
     let status = child
         .wait()
         .context("the encryption helper did not finish")?;
-    let tail = drain.join().unwrap_or_default();
+    let mut tail = drain.join().unwrap_or_default();
 
-    if status.success() {
+    let result = if status.success() {
         Ok(())
     } else {
-        // If the child echoed the passphrase before switching the tty to
-        // no-echo, scrub it so it can never surface in an error message.
+        // Belt-and-suspenders: with echo suppressed the passphrase should never
+        // reach here, but scrub any literal copy before it could surface.
         Err(error_from(status, &scrub_secret(&tail, passphrase)))
-    }
+    };
+    // The raw terminal tail can hold sensitive bytes; wipe it before dropping.
+    tail.zeroize();
+    result
 }
 
 /// Remove every literal occurrence of `secret` from `data`.
@@ -169,17 +183,21 @@ fn answer_prompts(
                 while sent < prompts {
                     let low = pending.to_ascii_lowercase();
                     match low.find(&needle) {
-                        Some(idx) => {
-                            // Brief pause so the child has switched the tty to
-                            // no-echo mode before we type.
+                        Some(_idx) => {
+                            // Small settle before answering; echo is already
+                            // suppressed (see tcsetattr above), so nothing of
+                            // ours is reflected back into the stream.
                             thread::sleep(Duration::from_millis(60));
                             let _ = master.write_all(passphrase.as_bytes());
                             let _ = master.write_all(b"\n");
                             let _ = master.flush();
                             sent += 1;
                             quiet_deadline = Some(Instant::now() + QUIET_WINDOW);
-                            let consume = (idx + needle.len()).min(pending.len());
-                            pending.drain(..consume);
+                            // Discard everything seen so far — the matched prompt
+                            // line and any stray bytes — so we never rematch our
+                            // own input. The tools prompt sequentially, so a
+                            // genuine next prompt arrives in a later read.
+                            pending.clear();
                         }
                         None => break,
                     }
@@ -194,6 +212,9 @@ fn answer_prompts(
             Err(_) => break,
         }
     }
+    // These buffers can hold echoed prompt/input bytes; wipe before dropping.
+    pending.zeroize();
+    buf.zeroize();
     Ok(())
 }
 
@@ -208,7 +229,12 @@ fn drain_to_tail(master: &mut File) -> Vec<u8> {
             Ok(n) => {
                 tail.extend_from_slice(&buf[..n]);
                 if tail.len() > TAIL_CAP {
-                    let cut = tail.len() - TAIL_CAP;
+                    let mut cut = tail.len() - TAIL_CAP;
+                    // Don't slice through a UTF-8 sequence: advance to the next
+                    // lead byte so the later from_utf8_lossy starts clean.
+                    while cut < tail.len() && tail[cut] & 0xC0 == 0x80 {
+                        cut += 1;
+                    }
                     tail.drain(..cut);
                 }
             }
