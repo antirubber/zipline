@@ -9,8 +9,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      # Third-party actions are pinned to a commit SHA, not a mutable tag, so a
+      # tag-overwrite of the upstream action can't inject code into CI. The
+      # trailing comment records the version each SHA stood for.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy, rustfmt
       - name: Install encryption backends
@@ -23,3 +26,14 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --all
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      # Fail the build on a dependency with a known RustSec advisory. Runs in its
+      # own job so a fresh advisory is reported as an audit failure rather than
+      # masquerading as a broken test.
+      - name: Audit dependencies
+        run: cargo install cargo-audit --locked && cargo audit

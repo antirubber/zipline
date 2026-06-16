@@ -20,8 +20,11 @@ jobs:
           - target: aarch64-unknown-linux-musl
             asset: zipline-linux-arm64
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      # Third-party actions are pinned to a commit SHA, not a mutable tag, so a
+      # tag-overwrite of the upstream action can't tamper with release binaries.
+      # The trailing comment records the version each SHA stood for.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}
       - name: Install cross
@@ -32,8 +35,14 @@ jobs:
         run: |
           cp "target/${{ matrix.target }}/release/zipline" "${{ matrix.asset }}"
           sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+      # Confirm the binary at least runs before publishing it, so a silently
+      # broken build never reaches a release. Only the amd64 musl binary can run
+      # on this x86_64 runner; the arm64 one is cross-built and not executable here.
+      - name: Smoke test
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: ./${{ matrix.asset }} --version
       - name: Attach to release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           files: |
             ${{ matrix.asset }}
