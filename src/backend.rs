@@ -91,6 +91,26 @@ pub fn suggested_output(source: &Path, backend: Backend) -> PathBuf {
     parent.join(format!("{name}.{}", backend.extension()))
 }
 
+/// The default output for locking several items that share a folder: placed in
+/// that folder, named after it (items in `Photos/` -> `Photos/Photos.7z`). With
+/// exactly one source this is identical to [`suggested_output`].
+pub fn suggested_output_multi(sources: &[PathBuf], backend: Backend) -> PathBuf {
+    match sources {
+        [one] => suggested_output(one, backend),
+        _ => {
+            let parent = sources
+                .first()
+                .and_then(|p| p.parent())
+                .unwrap_or_else(|| Path::new("."));
+            let name = parent
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "archive".to_string());
+            parent.join(format!("{name}.{}", backend.extension()))
+        }
+    }
+}
+
 /// Encrypt or pack `source` (a file or directory) into `output` at compression
 /// `level` (0 = none … 9 = smallest). age and 7z lock the result with
 /// `passphrase`; zip never encrypts and ignores it. For age the contents are
@@ -98,14 +118,16 @@ pub fn suggested_output(source: &Path, backend: Backend) -> PathBuf {
 /// stay confidential.
 pub fn encrypt(
     backend: Backend,
-    source: &Path,
+    sources: &[PathBuf],
     output: &Path,
     passphrase: &str,
     level: u8,
 ) -> Result<()> {
     let program = backend.program()?;
-    if !source.exists() {
-        bail!("{} does not exist", source.display());
+    for source in sources {
+        if !source.exists() {
+            bail!("{} does not exist", source.display());
+        }
     }
     // zip is compress-only; age and 7z always encrypt, so a missing password
     // there is a mistake.
@@ -115,10 +137,12 @@ pub fn encrypt(
     let level = level.min(9);
     prepare_output(output)?;
 
-    let (parent, name) = split(source)?;
+    let (parent, names) = split_many(sources)?;
 
     // One place removes any partial output if the backend fails part-way.
-    let result = pack(backend, &program, &parent, &name, output, passphrase, level);
+    let result = pack(
+        backend, &program, &parent, &names, output, passphrase, level,
+    );
     if result.is_err() {
         cleanup(output);
     }
@@ -129,25 +153,27 @@ pub fn encrypt(
 /// passphrase to share. age-only. Like the passphrase path, the contents are
 /// tarred (and optionally gzipped) first so file names stay confidential.
 pub fn encrypt_for_recipients(
-    source: &Path,
+    sources: &[PathBuf],
     output: &Path,
     recipients: &[String],
     level: u8,
 ) -> Result<()> {
     let program = Backend::Age.program()?;
-    if !source.exists() {
-        bail!("{} does not exist", source.display());
+    for source in sources {
+        if !source.exists() {
+            bail!("{} does not exist", source.display());
+        }
     }
     if recipients.is_empty() {
         bail!("no recipient given");
     }
     let level = level.min(9);
     prepare_output(output)?;
-    let (parent, name) = split(source)?;
+    let (parent, names) = split_many(sources)?;
     let result = age_encrypt(
         &program,
         &parent,
-        &name,
+        &names,
         output,
         AgeLock::Recipients(recipients),
         level,
@@ -178,7 +204,7 @@ fn pack(
     backend: Backend,
     program: &Path,
     parent: &Path,
-    name: &OsStr,
+    names: &[OsString],
     output: &Path,
     passphrase: &str,
     level: u8,
@@ -187,7 +213,7 @@ fn pack(
         Backend::Age => age_encrypt(
             program,
             parent,
-            name,
+            names,
             output,
             AgeLock::Passphrase(passphrase),
             level,
@@ -202,7 +228,7 @@ fn pack(
                 .arg("-y")
                 .arg("--")
                 .arg(output)
-                .arg(name);
+                .args(names);
             pty::run(cmd, Input::Tty, passphrase, "password", 2)
         }
         Backend::Zip => {
@@ -215,7 +241,7 @@ fn pack(
                 .arg("-y")
                 .arg("--")
                 .arg(output)
-                .arg(name);
+                .args(names);
             run_quietly(cmd).with_context(|| format!("could not create {}", output.display()))
         }
     }
@@ -235,7 +261,7 @@ enum AgeLock<'a> {
 fn age_encrypt(
     program: &Path,
     parent: &Path,
-    name: &OsStr,
+    names: &[OsString],
     output: &Path,
     lock: AgeLock,
     level: u8,
@@ -245,7 +271,7 @@ fn age_encrypt(
         .arg("-C")
         .arg(parent)
         .arg("--")
-        .arg(name)
+        .args(names)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -297,7 +323,7 @@ fn age_encrypt(
     };
     enc?;
     if !tar_status.success() || !gzip_ok {
-        bail!("could not read {}", parent.join(name).display());
+        bail!("could not read from {}", parent.display());
     }
     Ok(())
 }
@@ -649,17 +675,31 @@ pub fn backend_for(archive: &Path) -> Result<Backend> {
     }
 }
 
-/// Split `source` into (parent dir, file name). The name is kept as an
-/// `OsString` so non-UTF8 names reach tar/7z intact instead of being mangled.
-fn split(source: &Path) -> Result<(PathBuf, OsString)> {
-    let abs = fs::canonicalize(source)
-        .with_context(|| format!("could not resolve {}", source.display()))?;
-    let name = abs
-        .file_name()
-        .ok_or_else(|| anyhow!("cannot encrypt the filesystem root"))?
-        .to_os_string();
-    let parent = abs.parent().unwrap_or_else(|| Path::new("/")).to_path_buf();
-    Ok((parent, name))
+/// Split several sources into their shared parent dir and the list of file
+/// names within it. Every item must live in the same folder, so one `tar`/`7z`
+/// invocation (run from that folder) can bundle them all by relative name.
+/// Names are kept as `OsString` so non-UTF8 names reach the tools intact.
+fn split_many(sources: &[PathBuf]) -> Result<(PathBuf, Vec<OsString>)> {
+    if sources.is_empty() {
+        bail!("nothing to lock");
+    }
+    let mut parent: Option<PathBuf> = None;
+    let mut names = Vec::with_capacity(sources.len());
+    for source in sources {
+        let abs = fs::canonicalize(source)
+            .with_context(|| format!("could not resolve {}", source.display()))?;
+        let name = abs
+            .file_name()
+            .ok_or_else(|| anyhow!("cannot encrypt the filesystem root"))?
+            .to_os_string();
+        let dir = abs.parent().unwrap_or_else(|| Path::new("/")).to_path_buf();
+        match &parent {
+            Some(p) if *p != dir => bail!("all items must be in the same folder"),
+            _ => parent = Some(dir),
+        }
+        names.push(name);
+    }
+    Ok((parent.expect("sources is non-empty"), names))
 }
 
 /// Turn a backend's raw failure into a friendly message. A clearly wrong key
@@ -872,7 +912,7 @@ mod tests {
 
         let out = suggested_output(&src, Backend::Zip);
         assert_eq!(out, dir.path().join("docs.zip"));
-        encrypt(Backend::Zip, &src, &out, "", 5).unwrap(); // zip is compress-only
+        encrypt(Backend::Zip, std::slice::from_ref(&src), &out, "", 5).unwrap(); // zip is compress-only
         assert!(out.exists());
         assert!(
             !is_encrypted(&out).unwrap(),
@@ -895,9 +935,9 @@ mod tests {
         fs::write(src.join("a.txt"), vec![b'a'; 4096]).unwrap();
 
         let stored = dir.path().join("stored.zip");
-        encrypt(Backend::Zip, &src, &stored, "", 0).unwrap();
+        encrypt(Backend::Zip, std::slice::from_ref(&src), &stored, "", 0).unwrap();
         let smallest = dir.path().join("smallest.zip");
-        encrypt(Backend::Zip, &src, &smallest, "", 9).unwrap();
+        encrypt(Backend::Zip, std::slice::from_ref(&src), &smallest, "", 9).unwrap();
 
         // Highly compressible input: max level must beat store.
         assert!(
@@ -951,7 +991,7 @@ mod tests {
         fs::write(src.join("a.txt"), b"hello").unwrap();
 
         let plain = dir.path().join("plain.zip");
-        encrypt(Backend::Zip, &src, &plain, "", 5).unwrap();
+        encrypt(Backend::Zip, std::slice::from_ref(&src), &plain, "", 5).unwrap();
         assert!(!is_encrypted(&plain).unwrap(), "plain zip is not encrypted");
 
         let locked = dir.path().join("locked.zip");
@@ -1091,10 +1131,96 @@ mod tests {
         symlink("/etc/passwd", src.join("esc")).unwrap();
 
         let out = dir.path().join("folder.age");
-        encrypt(Backend::Age, &src, &out, "pw", 0).unwrap();
+        encrypt(Backend::Age, std::slice::from_ref(&src), &out, "pw", 0).unwrap();
 
         let dest = dir.path().join("dest");
         let err = decrypt(&out, &dest, "pw").unwrap_err();
         assert!(err.to_string().contains("outside the folder"), "got: {err}");
+    }
+
+    #[test]
+    fn split_many_groups_items_under_their_shared_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        fs::write(dir.path().join("b.txt"), b"b").unwrap();
+        let (parent, names) =
+            split_many(&[dir.path().join("a.txt"), dir.path().join("b.txt")]).unwrap();
+        assert_eq!(parent, fs::canonicalize(dir.path()).unwrap());
+        assert_eq!(
+            names,
+            vec![OsString::from("a.txt"), OsString::from("b.txt")]
+        );
+    }
+
+    #[test]
+    fn split_many_rejects_items_from_different_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        fs::write(sub.join("b.txt"), b"b").unwrap();
+        let err = split_many(&[dir.path().join("a.txt"), sub.join("b.txt")]).unwrap_err();
+        assert!(err.to_string().contains("same folder"), "got: {err}");
+    }
+
+    #[test]
+    fn suggested_output_multi_names_the_archive_after_the_folder() {
+        let one =
+            suggested_output_multi(&[PathBuf::from("/home/u/Photos/a.jpg")], Backend::SevenZip);
+        assert_eq!(one, PathBuf::from("/home/u/Photos/a.jpg.7z"));
+        let many = suggested_output_multi(
+            &[
+                PathBuf::from("/home/u/Photos/a.jpg"),
+                PathBuf::from("/home/u/Photos/b.jpg"),
+            ],
+            Backend::SevenZip,
+        );
+        assert_eq!(many, PathBuf::from("/home/u/Photos/Photos.7z"));
+    }
+
+    #[test]
+    fn multi_file_7z_roundtrip_bundles_every_item() {
+        if !seven_zip_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"alpha").unwrap();
+        fs::write(dir.path().join("b.txt"), b"bravo").unwrap();
+        fs::create_dir(dir.path().join("notes")).unwrap();
+        fs::write(dir.path().join("notes/c.txt"), b"charlie").unwrap();
+
+        let sources = vec![
+            dir.path().join("a.txt"),
+            dir.path().join("b.txt"),
+            dir.path().join("notes"),
+        ];
+        let out = dir.path().join("bundle.7z");
+        encrypt(Backend::SevenZip, &sources, &out, "pw", 5).unwrap();
+
+        let dest = dir.path().join("restored");
+        decrypt(&out, &dest, "pw").unwrap();
+        assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(fs::read(dest.join("b.txt")).unwrap(), b"bravo");
+        assert_eq!(fs::read(dest.join("notes/c.txt")).unwrap(), b"charlie");
+    }
+
+    #[test]
+    fn multi_file_age_roundtrip_bundles_every_item() {
+        if Backend::Age.locate().is_none() {
+            eprintln!("skipping: age backend not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"alpha").unwrap();
+        fs::write(dir.path().join("b.txt"), b"bravo").unwrap();
+
+        let sources = vec![dir.path().join("a.txt"), dir.path().join("b.txt")];
+        let out = dir.path().join("bundle.age");
+        encrypt(Backend::Age, &sources, &out, "pw", 6).unwrap();
+
+        let dest = dir.path().join("restored");
+        decrypt(&out, &dest, "pw").unwrap();
+        assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(fs::read(dest.join("b.txt")).unwrap(), b"bravo");
     }
 }

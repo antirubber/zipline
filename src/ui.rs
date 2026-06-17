@@ -333,13 +333,40 @@ fn browse(frame: &mut Frame, area: Rect, app: &mut App) {
                 Row::Dir(_) => Style::new().fg(ACCENT),
                 Row::File(_) => Style::new().fg(Color::Gray),
             };
-            ListItem::new(Line::from(Span::styled(format!("  {label}"), style)))
+            // Encrypt mode shows a checkbox for the markable rows; the control
+            // rows get matching padding so labels still line up. Decrypt picks a
+            // single archive and has no checkbox column.
+            let prefix = match row {
+                Row::Dir(p) | Row::File(p) if app.flow == Flow::Encrypt => {
+                    if app.browser.is_selected(p) {
+                        "[x] "
+                    } else {
+                        "[ ] "
+                    }
+                }
+                _ if app.flow == Flow::Encrypt => "    ",
+                _ => "",
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!("  {prefix}{label}"),
+                style,
+            )))
         })
         .collect();
 
     let prompt = match app.flow {
-        Flow::Encrypt => "Choose what to lock",
-        Flow::Decrypt => "Choose a file to extract",
+        Flow::Encrypt => {
+            let n = app.browser.selected_count();
+            if n > 0 {
+                format!(
+                    "Space mark · Enter lock {n} item{}",
+                    if n == 1 { "" } else { "s" }
+                )
+            } else {
+                "Choose what to lock · Space to mark several".to_string()
+            }
+        }
+        Flow::Decrypt => "Choose a file to extract".to_string(),
     };
 
     let block =
@@ -386,12 +413,7 @@ fn browse(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn passphrase(frame: &mut Frame, area: Rect, app: &App) {
-    let name = app
-        .source
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let name = app.target_name();
 
     let mut lines = vec![Line::from("")];
     match app.flow {
@@ -440,7 +462,7 @@ fn passphrase(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn review(frame: &mut Frame, area: Rect, app: &App) {
-    let source = path_str(&app.source);
+    let source = app.source_display();
     let output = path_str(&app.output);
     let mut lines = vec![Line::from("")];
     match app.flow {
@@ -453,6 +475,18 @@ fn review(frame: &mut Frame, area: Rect, app: &App) {
             }));
             lines.push(Line::from(""));
             lines.push(kv("From ", &source));
+            if app.sources.len() > 1 {
+                for s in &app.sources {
+                    let item = s
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    lines.push(Line::from(Span::styled(
+                        format!("        • {item}"),
+                        Style::new().fg(DIM),
+                    )));
+                }
+            }
             if app.editing_output {
                 lines.push(edit_line("To   ", &app.output_input));
             } else {

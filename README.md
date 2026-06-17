@@ -43,11 +43,14 @@ The wizard does the rest:
    zip take a level 0–9).
 4. Find the file or folder: arrow through the list, **type to filter** it,
    **paste a full path** and press Enter to jump straight there, or press
-   **Tab** to show hidden (dot) files.
+   **Tab** to show hidden (dot) files. To bundle several items from the same
+   folder into one archive, press **Space** to mark each one, then **Enter** to
+   lock them all together.
 5. Type a password (twice) — skipped for zip, which never has one. Press
    **Ctrl-R** to reveal what you typed, and you'll be warned before replacing an
    existing file.
-6. Done — you get one file next to the original.
+6. Done — you get one file next to the original (named after the folder when you
+   marked several items).
 
 **To open it again**
 1. Run `zipline` and choose **Open a locked file**.
@@ -76,7 +79,13 @@ history):
 ```sh
 zipline lock ~/Photos --backend age --level 9      # writes ~/Photos.age
 zipline open ~/Photos.age --out ~/Restored
+
+# Bundle several items from one folder into a single archive:
+zipline lock ~/taxes/w2.pdf ~/taxes/receipts --backend 7z   # writes ~/taxes/taxes.7z
 ```
+
+The items you lock together must live in the same folder; the archive is named
+after it unless you pass `--out`.
 
 `zipline doctor` reports which helper tools are installed.
 

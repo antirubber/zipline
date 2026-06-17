@@ -69,7 +69,9 @@ pub struct App {
     pub password: String,
     pub confirm: String,
     pub field: Field,
-    pub source: Option<PathBuf>,
+    /// What will be locked/opened. The encrypt flow may hold several items that
+    /// share a folder (multi-select); decrypt always holds exactly one archive.
+    pub sources: Vec<PathBuf>,
     pub output: Option<PathBuf>,
     /// age lock method (password vs recipients), chosen on the AgeMethod step.
     pub age_method: AgeMethod,
@@ -110,7 +112,7 @@ impl App {
             password: String::new(),
             confirm: String::new(),
             field: Field::Password,
-            source: None,
+            sources: Vec::new(),
             output: None,
             age_method: AgeMethod::Password,
             recipients: Vec::new(),
@@ -317,6 +319,12 @@ impl App {
             KeyCode::Up => self.browser.move_up(),
             KeyCode::Down => self.browser.move_down(),
             KeyCode::Left => self.browser.go_up(),
+            // Space marks the highlighted item for multi-select (encrypt only),
+            // but only when not mid-query so a space can still be typed into a
+            // filter or a pasted path.
+            KeyCode::Char(' ') if self.flow == Flow::Encrypt && self.browser.query().is_empty() => {
+                self.browser.toggle_selected()
+            }
             KeyCode::Char(c) => self.browser.push_query(c),
             KeyCode::Backspace => {
                 if self.browser.query().is_empty() {
@@ -336,6 +344,12 @@ impl App {
                 }
             }
             KeyCode::Enter | KeyCode::Right => {
+                // Marked items take precedence: lock them all as one archive.
+                if self.flow == Flow::Encrypt && self.browser.has_selection() {
+                    let paths = self.browser.take_selected();
+                    self.choose_paths(paths);
+                    return;
+                }
                 let action = if self.browser.is_path_query() {
                     self.browser.resolve_query()
                 } else {
@@ -353,53 +367,89 @@ impl App {
         }
     }
 
+    /// A single path was chosen: one file via Enter on the encrypt browser, or
+    /// the archive to open on the decrypt browser.
     fn choose_path(&mut self, path: PathBuf) {
+        match self.flow {
+            Flow::Encrypt => self.choose_paths(vec![path]),
+            Flow::Decrypt => self.choose_archive(path),
+        }
+    }
+
+    /// Several items were marked to encrypt. They share a folder, so they bundle
+    /// into one archive named after it.
+    fn choose_paths(&mut self, paths: Vec<PathBuf>) {
         self.password.zeroize();
         self.confirm.zeroize();
         self.field = Field::Password;
 
-        match self.flow {
-            Flow::Encrypt => {
-                self.output = Some(backend::suggested_output(&path, self.backend));
-                self.source = Some(path);
-                if self.backend == Backend::Age && self.age_method == AgeMethod::Recipients {
-                    // No passphrase — collect the recipient's public key next.
-                    self.text_input.clear();
-                    self.step = Step::Recipient;
-                } else if self.backend == Backend::Zip {
-                    self.enter_review(); // compress-only, no password
-                } else {
-                    self.step = Step::Passphrase;
+        self.output = Some(backend::suggested_output_multi(&paths, self.backend));
+        self.sources = paths;
+        if self.backend == Backend::Age && self.age_method == AgeMethod::Recipients {
+            // No passphrase — collect the recipient's public key next.
+            self.text_input.clear();
+            self.step = Step::Recipient;
+        } else if self.backend == Backend::Zip {
+            self.enter_review(); // compress-only, no password
+        } else {
+            self.step = Step::Passphrase;
+        }
+    }
+
+    /// An archive was chosen to open (decrypt). Always a single file.
+    fn choose_archive(&mut self, path: PathBuf) {
+        self.password.zeroize();
+        self.confirm.zeroize();
+        self.field = Field::Password;
+
+        match backend::backend_for(&path) {
+            Ok(b) => {
+                if b.locate().is_none() {
+                    self.note = Some(format!(
+                        "Opening this file needs {}. {}",
+                        b.title(),
+                        b.install_hint()
+                    ));
+                    return;
                 }
+                self.backend = b;
             }
-            Flow::Decrypt => {
-                match backend::backend_for(&path) {
-                    Ok(b) => {
-                        if b.locate().is_none() {
-                            self.note = Some(format!(
-                                "Opening this file needs {}. {}",
-                                b.title(),
-                                b.install_hint()
-                            ));
-                            return;
-                        }
-                        self.backend = b;
-                    }
-                    Err(e) => {
-                        self.note = Some(e.to_string());
-                        return;
-                    }
-                }
-                self.output = path.parent().map(|p| p.to_path_buf());
-                // A plain (unencrypted) zip opens without asking for a password.
-                let encrypted = backend::is_encrypted(&path).unwrap_or(true);
-                self.source = Some(path);
-                if encrypted {
-                    self.step = Step::Passphrase;
-                } else {
-                    self.enter_review();
-                }
+            Err(e) => {
+                self.note = Some(e.to_string());
+                return;
             }
+        }
+        self.output = path.parent().map(|p| p.to_path_buf());
+        // A plain (unencrypted) zip opens without asking for a password.
+        let encrypted = backend::is_encrypted(&path).unwrap_or(true);
+        self.sources = vec![path];
+        if encrypted {
+            self.step = Step::Passphrase;
+        } else {
+            self.enter_review();
+        }
+    }
+
+    /// A short label for what is being locked/opened: the single item's file
+    /// name, or "N items" for a multi-select. Used by the password and review
+    /// screens.
+    pub fn target_name(&self) -> String {
+        match self.sources.as_slice() {
+            [one] => one
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            many => format!("{} items", many.len()),
+        }
+    }
+
+    /// The Review screen's "From"/"File" value: the single item's full path, or
+    /// "N items" for a multi-select (the items are then listed beneath it).
+    pub fn source_display(&self) -> String {
+        match self.sources.as_slice() {
+            [] => String::new(),
+            [one] => one.to_string_lossy().into_owned(),
+            many => format!("{} items", many.len()),
         }
     }
 
@@ -635,7 +685,7 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Enter => {
                 self.outcome = None;
-                self.source = None;
+                self.sources.clear();
                 self.output = None;
                 self.menu = 0;
                 self.reset_lock_state();
@@ -648,9 +698,13 @@ impl App {
     // -- worker -----------------------------------------------------------
 
     fn start_job(&mut self) {
-        let (Some(source), Some(output)) = (self.source.clone(), self.output.clone()) else {
+        let Some(output) = self.output.clone() else {
             return;
         };
+        if self.sources.is_empty() {
+            return;
+        }
+        let sources = self.sources.clone();
         let backend = self.backend;
         let flow = self.flow;
         let level = self.level;
@@ -667,15 +721,15 @@ impl App {
             let result = match flow {
                 Flow::Encrypt => {
                     let r = if backend == Backend::Age && age_method == AgeMethod::Recipients {
-                        backend::encrypt_for_recipients(&source, &output, &recipients, level)
+                        backend::encrypt_for_recipients(&sources, &output, &recipients, level)
                     } else {
-                        backend::encrypt(backend, &source, &output, &password, level)
+                        backend::encrypt(backend, &sources, &output, &password, level)
                     };
                     r.map(|()| output.clone())
                 }
                 Flow::Decrypt => match &identity {
-                    Some(id) => backend::decrypt_with_identity(&source, &output, id),
-                    None => backend::decrypt(&source, &output, &password),
+                    Some(id) => backend::decrypt_with_identity(&sources[0], &output, id),
+                    None => backend::decrypt(&sources[0], &output, &password),
                 },
             };
             let _ = tx.send(result.map_err(|e| e.to_string()));
@@ -782,6 +836,53 @@ mod tests {
     }
 
     #[test]
+    fn browse_space_marks_files_then_enter_locks_them_together() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        fs::write(dir.path().join("b.txt"), b"b").unwrap();
+
+        let mut app = App::new();
+        app.flow = Flow::Encrypt;
+        app.backend = Backend::Zip; // compress-only: straight to Review, no password
+        app.browser = Browser::new(dir.path().to_path_buf(), None);
+        app.step = Step::Browse;
+
+        // Rows: [lock-folder, up, a.txt, b.txt]. Mark both files with Space.
+        app.on_key(press(KeyCode::Down)); // up
+        app.on_key(press(KeyCode::Down)); // a.txt
+        app.on_key(press(KeyCode::Char(' ')));
+        app.on_key(press(KeyCode::Down)); // b.txt
+        app.on_key(press(KeyCode::Char(' ')));
+        assert_eq!(app.browser.selected_count(), 2);
+
+        app.on_key(press(KeyCode::Enter));
+        assert!(matches!(app.step, Step::Review));
+        assert_eq!(
+            app.sources,
+            vec![dir.path().join("a.txt"), dir.path().join("b.txt")]
+        );
+        // The archive is named after the folder the items share.
+        let folder = dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(app.output, Some(dir.path().join(format!("{folder}.zip"))));
+    }
+
+    #[test]
+    fn browse_space_does_not_mark_while_typing_a_query() {
+        let mut app = App::new();
+        app.flow = Flow::Encrypt;
+        app.step = Step::Browse;
+        typed(&mut app, "re");
+        app.on_key(press(KeyCode::Char(' '))); // mid-query: a literal space
+        assert_eq!(app.browser.query(), "re ");
+        assert_eq!(app.browser.selected_count(), 0);
+    }
+
+    #[test]
     fn choosing_a_backend_advances_the_wizard() {
         for (downs, backend) in [
             (0usize, Backend::Age),
@@ -880,7 +981,7 @@ mod tests {
         fs::create_dir(&src).unwrap();
         fs::write(src.join("a.txt"), b"hi").unwrap();
         let zip = dir.path().join("docs.zip");
-        backend::encrypt(Backend::Zip, &src, &zip, "", 5).unwrap();
+        backend::encrypt(Backend::Zip, std::slice::from_ref(&src), &zip, "", 5).unwrap();
 
         let mut app = App::new();
         app.flow = Flow::Decrypt;
@@ -902,7 +1003,7 @@ mod tests {
     fn mismatched_passwords_are_rejected() {
         let mut app = App::new();
         app.flow = Flow::Encrypt;
-        app.source = Some(PathBuf::from("/tmp/whatever"));
+        app.sources = vec![PathBuf::from("/tmp/whatever")];
         app.step = Step::Passphrase;
         app.field = Field::Password;
 
@@ -922,7 +1023,7 @@ mod tests {
     fn matching_passwords_advance_to_review() {
         let mut app = App::new();
         app.flow = Flow::Encrypt;
-        app.source = Some(PathBuf::from("/tmp/whatever"));
+        app.sources = vec![PathBuf::from("/tmp/whatever")];
         app.step = Step::Passphrase;
 
         typed(&mut app, "hunter2");
@@ -949,7 +1050,7 @@ mod tests {
         let mut app = App::new();
         app.flow = Flow::Encrypt;
         app.backend = Backend::Age;
-        app.source = Some(src.clone());
+        app.sources = vec![src.clone()];
         app.output = Some(out.clone());
         app.password = "s3cret".into();
         app.step = Step::Review;
@@ -972,7 +1073,7 @@ mod tests {
         let dest = ws.path().join("restored");
         let mut app = App::new();
         app.flow = Flow::Decrypt;
-        app.source = Some(out.clone());
+        app.sources = vec![out.clone()];
         app.output = Some(dest.clone());
         app.password = "s3cret".into();
         app.step = Step::Review;
@@ -1090,7 +1191,7 @@ mod tests {
         let mut app = App::new();
         app.flow = Flow::Decrypt;
         app.backend = Backend::Age;
-        app.source = Some(dir.path().join("x.age"));
+        app.sources = vec![dir.path().join("x.age")];
         app.output = Some(dir.path().to_path_buf());
         app.step = Step::Identity;
         typed(&mut app, key.to_str().unwrap());
@@ -1141,7 +1242,7 @@ mod tests {
 
         let mut app = App::new();
         app.flow = Flow::Encrypt;
-        app.source = Some(dir.path().join("thing"));
+        app.sources = vec![dir.path().join("thing")];
         app.output = Some(out);
         app.step = Step::Passphrase;
         typed(&mut app, "hunter2");
@@ -1161,7 +1262,7 @@ mod tests {
 
         let mut app = App::new();
         app.flow = Flow::Encrypt;
-        app.source = Some(dir.path().join("thing"));
+        app.sources = vec![dir.path().join("thing")];
         app.output = Some(dir.path().join("thing.age")); // fresh, no overwrite
         app.step = Step::Review;
 
@@ -1187,7 +1288,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::new();
         app.flow = Flow::Encrypt;
-        app.source = Some(dir.path().join("thing"));
+        app.sources = vec![dir.path().join("thing")];
         app.output = Some(dir.path().join("thing.age"));
         app.step = Step::Review;
 
@@ -1210,7 +1311,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = App::new();
         app.flow = Flow::Encrypt;
-        app.source = Some(dir.path().join("thing"));
+        app.sources = vec![dir.path().join("thing")];
         app.output = Some(dir.path().join("thing.age")); // does not exist
         app.step = Step::Passphrase;
         typed(&mut app, "pw");

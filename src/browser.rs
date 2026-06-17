@@ -43,6 +43,10 @@ pub struct Browser {
     /// Whether dotfiles/dot-folders are shown (off by default for approachability;
     /// toggled so hidden files are still reachable without the paste-a-path trick).
     show_hidden: bool,
+    /// Items marked for multi-select, in the order they were marked. Only items
+    /// in the current folder can be marked, so they always share a parent and
+    /// the marks are dropped whenever the directory changes (see `enter`).
+    selected: Vec<PathBuf>,
 }
 
 impl Browser {
@@ -57,9 +61,57 @@ impl Browser {
             query: String::new(),
             only,
             show_hidden: false,
+            selected: Vec::new(),
         };
         b.reload();
         b
+    }
+
+    /// Change directory, dropping any multi-select marks (they only make sense
+    /// within one folder) and refreshing the listing.
+    fn enter(&mut self, dir: PathBuf) {
+        self.selected.clear();
+        self.cwd = dir;
+        self.reload();
+    }
+
+    /// Mark or unmark the highlighted file/folder for multi-select. The control
+    /// rows ("lock this folder", "up") are not selectable.
+    pub fn toggle_selected(&mut self) {
+        let Some(path) = self
+            .state
+            .selected()
+            .and_then(|i| self.rows.get(i))
+            .and_then(|row| match row {
+                Row::Dir(p) | Row::File(p) => Some(p.clone()),
+                _ => None,
+            })
+        else {
+            return;
+        };
+        match self.selected.iter().position(|p| *p == path) {
+            Some(pos) => {
+                self.selected.remove(pos);
+            }
+            None => self.selected.push(path),
+        }
+    }
+
+    pub fn is_selected(&self, path: &Path) -> bool {
+        self.selected.iter().any(|p| p == path)
+    }
+
+    pub fn has_selection(&self) -> bool {
+        !self.selected.is_empty()
+    }
+
+    pub fn selected_count(&self) -> usize {
+        self.selected.len()
+    }
+
+    /// Take the marked items, leaving the selection empty.
+    pub fn take_selected(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.selected)
     }
 
     /// Show or hide dotfiles/dot-folders, then refresh the listing.
@@ -125,8 +177,7 @@ impl Browser {
 
     pub fn go_up(&mut self) {
         if let Some(parent) = self.cwd.parent() {
-            self.cwd = parent.to_path_buf();
-            self.reload();
+            self.enter(parent.to_path_buf());
         }
     }
 
@@ -146,17 +197,10 @@ impl Browser {
                 Action::Browsed
             }
             Row::Dir(p) => {
-                if self.picking_archive() {
-                    self.cwd = p;
-                    self.reload();
-                    Action::Browsed
-                } else {
-                    // Encrypting: open the folder to browse inside it. Choosing
-                    // it is done via the "Lock this whole folder" row.
-                    self.cwd = p;
-                    self.reload();
-                    Action::Browsed
-                }
+                // Open the folder to browse inside it. A whole folder is chosen
+                // either via "Lock this whole folder" or by marking it (Space).
+                self.enter(p);
+                Action::Browsed
             }
             Row::File(p) => Action::Chosen(p),
         }
@@ -256,9 +300,8 @@ impl Browser {
     pub fn resolve_query(&mut self) -> Action {
         let target = self.expand(&self.query);
         if target.is_dir() {
-            self.cwd = target;
             self.query.clear();
-            self.reload();
+            self.enter(target);
             Action::Browsed
         } else if target.is_file() && self.file_allowed(&target) {
             Action::Chosen(target)
@@ -556,5 +599,67 @@ mod tests {
             Some(0),
             "down from the bottom wraps to the top"
         );
+    }
+
+    fn highlight_first_file(b: &mut Browser) -> PathBuf {
+        let idx = b
+            .rows()
+            .iter()
+            .position(|r| matches!(r, Row::File(_)))
+            .unwrap();
+        b.state.select(Some(idx));
+        match &b.rows()[idx] {
+            Row::File(p) => p.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn space_marks_and_unmarks_the_highlighted_item() {
+        let dir = fixture();
+        let mut b = Browser::new(dir.path().to_path_buf(), None);
+        let file = highlight_first_file(&mut b);
+        assert!(!b.has_selection());
+        b.toggle_selected();
+        assert_eq!(b.selected_count(), 1);
+        assert!(b.is_selected(&file));
+        b.toggle_selected();
+        assert!(!b.has_selection());
+    }
+
+    #[test]
+    fn control_rows_cannot_be_marked() {
+        let dir = fixture();
+        let mut b = Browser::new(dir.path().to_path_buf(), None);
+        b.state.select(Some(0)); // the "lock this whole folder" row
+        b.toggle_selected();
+        assert!(!b.has_selection());
+    }
+
+    #[test]
+    fn changing_directory_clears_the_selection() {
+        let dir = fixture();
+        let mut b = Browser::new(dir.path().to_path_buf(), None);
+        highlight_first_file(&mut b);
+        b.toggle_selected();
+        assert!(b.has_selection());
+        let sub = b
+            .rows()
+            .iter()
+            .position(|r| matches!(r, Row::Dir(_)))
+            .unwrap();
+        b.state.select(Some(sub));
+        b.activate();
+        assert!(!b.has_selection(), "marks drop when the folder changes");
+    }
+
+    #[test]
+    fn take_selected_drains_the_marks() {
+        let dir = fixture();
+        let mut b = Browser::new(dir.path().to_path_buf(), None);
+        highlight_first_file(&mut b);
+        b.toggle_selected();
+        assert_eq!(b.take_selected().len(), 1);
+        assert!(!b.has_selection());
     }
 }

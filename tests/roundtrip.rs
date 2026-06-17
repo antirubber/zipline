@@ -64,7 +64,7 @@ fn roundtrip(backend: Backend) {
     let original = snapshot(&src);
 
     let out = backend::suggested_output(&src, backend);
-    backend::encrypt(backend, &src, &out, PASS, 5).unwrap();
+    backend::encrypt(backend, std::slice::from_ref(&src), &out, PASS, 5).unwrap();
     assert!(
         out.exists(),
         "{} archive was not created",
@@ -105,7 +105,7 @@ fn zip_roundtrip_preserves_files_unencrypted() {
     let original = snapshot(&src);
 
     let out = backend::suggested_output(&src, Backend::Zip);
-    backend::encrypt(Backend::Zip, &src, &out, "", 5).unwrap(); // zip is compress-only
+    backend::encrypt(Backend::Zip, std::slice::from_ref(&src), &out, "", 5).unwrap(); // zip is compress-only
     assert!(out.exists());
     assert!(
         !backend::is_encrypted(&out).unwrap(),
@@ -154,7 +154,7 @@ fn age_recipient_roundtrip_preserves_files() {
     let original = snapshot(&src);
 
     let out = ws.path().join("docs.age");
-    backend::encrypt_for_recipients(&src, &out, &[pubkey], 5).unwrap();
+    backend::encrypt_for_recipients(std::slice::from_ref(&src), &out, &[pubkey], 5).unwrap();
     assert!(out.exists(), "recipient archive was not created");
 
     // A passphrase cannot open a recipient-encrypted archive; the identity can.
@@ -183,7 +183,7 @@ fn age_single_file_roundtrip() {
     fs::write(&src, b"dear diary, today i wrapped tar in age\n").unwrap();
 
     let out = backend::suggested_output(&src, backend);
-    backend::encrypt(backend, &src, &out, PASS, 5).unwrap();
+    backend::encrypt(backend, std::slice::from_ref(&src), &out, PASS, 5).unwrap();
 
     let dest = ws.path().join("out");
     backend::decrypt(&out, &dest, PASS).unwrap();
@@ -203,7 +203,7 @@ fn age_hides_file_names() {
     fs::write(src.join("salary_negotiation.txt"), b"top secret\n").unwrap();
 
     let out = backend::suggested_output(&src, backend);
-    backend::encrypt(backend, &src, &out, PASS, 5).unwrap();
+    backend::encrypt(backend, std::slice::from_ref(&src), &out, PASS, 5).unwrap();
 
     let cipher = fs::read(&out).unwrap();
     assert!(
@@ -227,7 +227,7 @@ fn age_rejects_wrong_password() {
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("a.txt"), b"data\n").unwrap();
     let out = backend::suggested_output(&src, backend);
-    backend::encrypt(backend, &src, &out, PASS, 5).unwrap();
+    backend::encrypt(backend, std::slice::from_ref(&src), &out, PASS, 5).unwrap();
 
     let dest = ws.path().join("out");
     let err = backend::decrypt(&out, &dest, "the wrong password").unwrap_err();
@@ -248,7 +248,7 @@ fn sevenzip_rejects_wrong_password() {
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("a.txt"), b"data\n").unwrap();
     let out = backend::suggested_output(&src, backend);
-    backend::encrypt(backend, &src, &out, PASS, 5).unwrap();
+    backend::encrypt(backend, std::slice::from_ref(&src), &out, PASS, 5).unwrap();
 
     let dest = ws.path().join("out");
     let err = backend::decrypt(&out, &dest, "the wrong password").unwrap_err();
@@ -270,9 +270,9 @@ fn reencrypting_same_target_is_idempotent() {
     fs::write(src.join("a.txt"), b"one\n").unwrap();
     let out = backend::suggested_output(&src, backend);
 
-    backend::encrypt(backend, &src, &out, PASS, 5).unwrap();
+    backend::encrypt(backend, std::slice::from_ref(&src), &out, PASS, 5).unwrap();
     // Encrypt again over the same output; it must not merge or fail.
-    backend::encrypt(backend, &src, &out, PASS, 5).unwrap();
+    backend::encrypt(backend, std::slice::from_ref(&src), &out, PASS, 5).unwrap();
 
     let dest = ws.path().join("out");
     backend::decrypt(&out, &dest, PASS).unwrap();
@@ -290,7 +290,7 @@ fn decrypt_does_not_overwrite_existing_folder() {
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("real.txt"), b"the original\n").unwrap();
     let out = backend::suggested_output(&src, backend);
-    backend::encrypt(backend, &src, &out, PASS, 5).unwrap();
+    backend::encrypt(backend, std::slice::from_ref(&src), &out, PASS, 5).unwrap();
 
     // Decrypt into the *same* parent, where "project" already exists.
     let dest = src.parent().unwrap();
@@ -319,7 +319,7 @@ fn decrypt_returns_created_path() {
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("f.txt"), b"hi\n").unwrap();
     let out = backend::suggested_output(&src, backend);
-    backend::encrypt(backend, &src, &out, PASS, 5).unwrap();
+    backend::encrypt(backend, std::slice::from_ref(&src), &out, PASS, 5).unwrap();
 
     let dest = ws.path().join("fresh");
     let produced = backend::decrypt(&out, &dest, PASS).unwrap();
@@ -340,7 +340,7 @@ fn marker_in_password_roundtrips(backend: Backend, password: &str) {
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("a.txt"), b"marker test\n").unwrap();
     let out = backend::suggested_output(&src, backend);
-    backend::encrypt(backend, &src, &out, password, 5).unwrap();
+    backend::encrypt(backend, std::slice::from_ref(&src), &out, password, 5).unwrap();
 
     let dest = ws.path().join("out");
     backend::decrypt(&out, &dest, password).unwrap();
@@ -428,6 +428,103 @@ fn suggested_output_appends_extension() {
     assert_eq!(p, PathBuf::from("/home/u/Photos.7z"));
     let p = backend::suggested_output(Path::new("/home/u/Photos"), Backend::Zip);
     assert_eq!(p, PathBuf::from("/home/u/Photos.zip"));
+}
+
+/// Locking several items that share a folder bundles them into one archive that
+/// restores every item. Exercises the real backend's multi-argument invocation.
+fn multi_roundtrip(backend: Backend, password: &str) {
+    if !available(backend) {
+        return;
+    }
+    let ws = workspace();
+    let dir = ws.path().join("bundle");
+    fs::create_dir_all(dir.join("sub")).unwrap();
+    fs::write(dir.join("a.txt"), b"alpha\n").unwrap();
+    fs::write(dir.join("b.bin"), vec![9u8, 8, 7, 6]).unwrap();
+    fs::write(dir.join("sub/c.txt"), b"charlie\n").unwrap();
+
+    let sources = vec![dir.join("a.txt"), dir.join("b.bin"), dir.join("sub")];
+    let out = ws.path().join("bundle").with_extension(backend.extension());
+    backend::encrypt(backend, &sources, &out, password, 5).unwrap();
+    assert!(
+        out.exists(),
+        "{} bundle was not created",
+        backend.extension()
+    );
+
+    let dest = ws.path().join("restored");
+    backend::decrypt(&out, &dest, password).unwrap();
+    assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"alpha\n");
+    assert_eq!(fs::read(dest.join("b.bin")).unwrap(), vec![9u8, 8, 7, 6]);
+    assert_eq!(fs::read(dest.join("sub/c.txt")).unwrap(), b"charlie\n");
+}
+
+#[test]
+fn age_multi_file_roundtrip() {
+    multi_roundtrip(Backend::Age, PASS);
+}
+
+#[test]
+fn sevenzip_multi_file_roundtrip() {
+    multi_roundtrip(Backend::SevenZip, PASS);
+}
+
+#[test]
+fn cli_zip_lock_multiple_paths_roundtrip() {
+    if !available(Backend::Zip) {
+        return;
+    }
+    let ws = workspace();
+    let dir = ws.path().join("docs");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.txt"), b"one\n").unwrap();
+    fs::write(dir.join("b.txt"), b"two\n").unwrap();
+
+    let out = ws.path().join("bundle.zip");
+    zipline::cli::lock(&[
+        dir.join("a.txt").to_str().unwrap().to_string(),
+        dir.join("b.txt").to_str().unwrap().to_string(),
+        "--backend".into(),
+        "zip".into(),
+        "--out".into(),
+        out.to_str().unwrap().to_string(),
+    ])
+    .unwrap();
+    assert!(out.exists(), "cli multi-path lock did not produce the zip");
+
+    let dest = ws.path().join("restored");
+    zipline::cli::open(&[
+        out.to_str().unwrap().to_string(),
+        "--out".into(),
+        dest.to_str().unwrap().to_string(),
+    ])
+    .unwrap();
+    assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"one\n");
+    assert_eq!(fs::read(dest.join("b.txt")).unwrap(), b"two\n");
+}
+
+#[test]
+fn cli_lock_rejects_items_in_different_folders() {
+    if !available(Backend::Zip) {
+        return;
+    }
+    let ws = workspace();
+    let a = ws.path().join("a.txt");
+    let sub = ws.path().join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(&a, b"a\n").unwrap();
+    fs::write(sub.join("b.txt"), b"b\n").unwrap();
+
+    let err = zipline::cli::lock(&[
+        a.to_str().unwrap().to_string(),
+        sub.join("b.txt").to_str().unwrap().to_string(),
+        "--backend".into(),
+        "zip".into(),
+        "--out".into(),
+        ws.path().join("bundle.zip").to_str().unwrap().to_string(),
+    ])
+    .unwrap_err();
+    assert!(err.to_string().contains("same folder"), "got: {err}");
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {

@@ -14,11 +14,12 @@ use zeroize::Zeroizing;
 use crate::backend::{self, Backend};
 
 const LOCK_USAGE: &str =
-    "usage: zipline lock <file-or-folder> [--out FILE] [--backend age|7z|zip] [--level 0-9]";
+    "usage: zipline lock <file-or-folder>... [--out FILE] [--backend age|7z|zip] [--level 0-9]";
 const OPEN_USAGE: &str = "usage: zipline open <file> [--out DIR]";
 
 struct LockArgs {
-    path: PathBuf,
+    /// One or more items to lock together. Several must share a folder.
+    paths: Vec<PathBuf>,
     out: Option<PathBuf>,
     backend: Backend,
     level: u8,
@@ -29,19 +30,20 @@ struct OpenArgs {
     out: Option<PathBuf>,
 }
 
-/// `zipline lock <path>`: encrypt/compress a file or folder, printing the path
-/// of the archive produced.
+/// `zipline lock <path>...`: encrypt/compress one or more files/folders (several
+/// must share a folder) into one archive, printing the path produced.
 pub fn lock(args: &[String]) -> Result<()> {
     let a = parse_lock(args)?;
-    let output = a
-        .out
-        .unwrap_or_else(|| backend::suggested_output(&a.path, a.backend));
+    let output = match a.out {
+        Some(o) => o,
+        None => backend::suggested_output_multi(&a.paths, a.backend),
+    };
 
     if a.backend == Backend::Zip {
-        backend::encrypt(a.backend, &a.path, &output, "", a.level)?;
+        backend::encrypt(a.backend, &a.paths, &output, "", a.level)?;
     } else {
         let password = prompt_new_password()?;
-        backend::encrypt(a.backend, &a.path, &output, &password, a.level)?;
+        backend::encrypt(a.backend, &a.paths, &output, &password, a.level)?;
     }
     println!("{}", output.display());
     Ok(())
@@ -68,7 +70,7 @@ pub fn open(args: &[String]) -> Result<()> {
 }
 
 fn parse_lock(args: &[String]) -> Result<LockArgs> {
-    let mut path: Option<PathBuf> = None;
+    let mut paths: Vec<PathBuf> = Vec::new();
     let mut out: Option<PathBuf> = None;
     let mut backend: Option<Backend> = None;
     let mut level: u8 = 5;
@@ -81,17 +83,15 @@ fn parse_lock(args: &[String]) -> Result<LockArgs> {
             }
             "--level" | "-l" => level = parse_level(&value(args, &mut i, "--level")?)?,
             s if s.starts_with('-') => bail!("unknown option '{s}'\n{LOCK_USAGE}"),
-            s => {
-                if path.is_some() {
-                    bail!("only one file or folder can be locked at a time\n{LOCK_USAGE}");
-                }
-                path = Some(PathBuf::from(s));
-            }
+            s => paths.push(PathBuf::from(s)),
         }
         i += 1;
     }
+    if paths.is_empty() {
+        bail!(LOCK_USAGE);
+    }
     Ok(LockArgs {
-        path: path.ok_or_else(|| anyhow!(LOCK_USAGE))?,
+        paths,
         out,
         backend: backend.unwrap_or(Backend::Age),
         level,
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn lock_defaults_to_age_normal_level() {
         let a = parse_lock(&args(&["photos"])).unwrap();
-        assert_eq!(a.path, PathBuf::from("photos"));
+        assert_eq!(a.paths, vec![PathBuf::from("photos")]);
         assert_eq!(a.backend, Backend::Age);
         assert_eq!(a.level, 5);
         assert!(a.out.is_none());
@@ -231,9 +231,31 @@ mod tests {
     }
 
     #[test]
+    fn lock_parses_multiple_paths() {
+        let a = parse_lock(&args(&["a.txt", "b.txt", "notes"])).unwrap();
+        assert_eq!(
+            a.paths,
+            vec![
+                PathBuf::from("a.txt"),
+                PathBuf::from("b.txt"),
+                PathBuf::from("notes"),
+            ]
+        );
+    }
+
+    #[test]
+    fn lock_parses_paths_around_flags() {
+        let a = parse_lock(&args(&["a.txt", "--backend", "7z", "b.txt"])).unwrap();
+        assert_eq!(
+            a.paths,
+            vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]
+        );
+        assert_eq!(a.backend, Backend::SevenZip);
+    }
+
+    #[test]
     fn lock_rejects_bad_input() {
         assert!(parse_lock(&args(&[])).is_err(), "missing path");
-        assert!(parse_lock(&args(&["a", "b"])).is_err(), "two paths");
         assert!(parse_lock(&args(&["a", "--nope"])).is_err(), "unknown flag");
         assert!(
             parse_lock(&args(&["a", "--backend", "rar"])).is_err(),
