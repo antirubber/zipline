@@ -1,6 +1,6 @@
 [package]
 name = "zipline"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "A friendly terminal wizard that encrypts your files and folders with one password."
 license = "MIT"
