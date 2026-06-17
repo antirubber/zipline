@@ -104,7 +104,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             if app.editing_output {
                 "type a path · Enter save · Esc cancel"
             } else {
-                "Enter confirm · e change destination · Esc back"
+                "Enter confirm · e rename / change folder · Esc back"
             }
         }
         Step::Working => "please wait…",
@@ -491,6 +491,7 @@ fn review(frame: &mut Frame, area: Rect, app: &App) {
                 lines.push(edit_line("To   ", &app.output_input));
             } else {
                 lines.push(kv("To   ", &output));
+                lines.push(dest_hint("e to rename or change folder"));
             }
             lines.push(kv("Using", app.backend.title()));
             if app.backend == Backend::Age && app.age_method == AgeMethod::Recipients {
@@ -529,6 +530,7 @@ fn review(frame: &mut Frame, area: Rect, app: &App) {
                 lines.push(edit_line("Into", &app.output_input));
             } else {
                 lines.push(kv("Into", &output));
+                lines.push(dest_hint("e to change folder"));
             }
             if let Some(id) = &app.identity {
                 lines.push(kv("Key", &id.to_string_lossy()));
@@ -664,6 +666,15 @@ fn kv(key: &str, value: &str) -> Line<'static> {
     ])
 }
 
+/// A dim note tucked under the destination, aligned with the value column, so the
+/// reader sees how to retarget the output without hunting the footer.
+fn dest_hint(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("        {text}"),
+        Style::new().fg(DIM),
+    ))
+}
+
 /// Like `kv`, but for the editable destination field: the value is accented and
 /// followed by a cursor bar.
 fn edit_line(key: &str, value: &str) -> Line<'static> {
@@ -753,11 +764,22 @@ mod tests {
     use ratatui::Terminal;
 
     fn draw(step: Step, prep: impl FnOnce(&mut App)) {
+        screen_text(step, prep);
+    }
+
+    /// Render a screen and return the whole buffer as one searchable string.
+    fn screen_text(step: Step, prep: impl FnOnce(&mut App)) -> String {
         let mut app = App::new();
         app.step = step;
         prep(&mut app);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| render(f, &mut app)).unwrap();
+        term.backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
     }
 
     #[test]
@@ -793,5 +815,29 @@ mod tests {
         draw(Step::Finished, |app| {
             app.outcome = Some(Err("wrong password, or the file is damaged".into()));
         });
+    }
+
+    #[test]
+    fn review_tells_you_how_to_rename_the_output() {
+        let s = screen_text(Step::Review, |app| {
+            app.flow = Flow::Encrypt;
+            app.output = Some(std::path::PathBuf::from("/tmp/Photos.age"));
+        });
+        assert!(
+            s.contains("rename"),
+            "Review must show that 'e' renames the output, got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn review_tells_you_how_to_change_the_extract_folder() {
+        let s = screen_text(Step::Review, |app| {
+            app.flow = Flow::Decrypt;
+            app.output = Some(std::path::PathBuf::from("/tmp/restored"));
+        });
+        assert!(
+            s.contains("e to change folder"),
+            "Review must show that 'e' changes the extract folder, got:\n{s}"
+        );
     }
 }
