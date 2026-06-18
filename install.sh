@@ -122,6 +122,16 @@ installed_version() {
 
 # --- install --------------------------------------------------------------
 choose_bindir() {
+  # Upgrade the copy already on PATH in place, so the binary the user actually
+  # runs is the one we replace. Installing elsewhere (e.g. always /usr/local/bin)
+  # leaves an older copy earlier on PATH shadowing the update — `zipline` keeps
+  # reporting the old version even though the new one installed fine.
+  local existing
+  existing="$(command -v "$BIN" 2>/dev/null || true)"
+  if [ -n "$existing" ]; then
+    dirname "$existing"
+    return 0
+  fi
   if [ -w /usr/local/bin ] 2>/dev/null; then
     echo "/usr/local/bin"
   elif [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1; then
@@ -215,7 +225,12 @@ main() {
   fi
 
   printf '\n'
-  ok "Done. Run '%s' to start." "$BIN"
+  ok "Done. Run '$BIN' to start."
 }
 
-main "$@"
+# Run the installer only when executed (directly or via `curl ... | bash`), not
+# when sourced — the test suite sources this file to exercise single functions
+# without performing an install.
+if ! (return 0 2>/dev/null); then
+  main "$@"
+fi
